@@ -1,4 +1,4 @@
-import { getDb } from '@/db/db';
+import { getDb, type SqlRunner } from '@/db/db';
 
 export interface BackupLog {
   id: string;
@@ -14,6 +14,21 @@ export interface BackupLog {
  * في بيئة المتصفح: تصدير قاعدة البيانات كـ JSON (نسخة احتياطية حقيقية).
  * في بيئة Electron الإنتاجية: تُستبدل هذه الدوال بآلية SQLite Backup API.
  */
+
+// ترتيب الجداول يتبع الاعتماد بينها (الجدول الأب قبل الأبناء)
+const DATA_TABLES = [
+  'users', 'roles', 'permissions', 'user_permissions', 'audit_logs', 'app_settings',
+  'activities', 'fiscal_periods', 'document_sequences', 'accounts', 'journal_entries',
+  'journal_lines', 'opening_balances', 'parties', 'party_transactions', 'cashboxes',
+  'cash_transactions', 'financial_transfers', 'checks', 'invoices', 'invoice_items',
+  'payments', 'returns', 'products', 'stock_movements', 'stock_counts', 'stock_count_items',
+  'expense_categories', 'expenses', 'expense_distributions', 'income_categories', 'incomes',
+  'employees', 'attendance', 'salary_records', 'employee_advances', 'employee_deductions',
+  'custom_fields', 'import_batches',
+];
+
+// سجل النسخ الاحتياطية يُصدَّر ولا يُستعاد، حتى لا تُمحى سجلات العمليات الحالية
+const LOG_TABLES = ['backup_logs'];
 
 export async function listBackupLogs(): Promise<BackupLog[]> {
   const db = await getDb();
@@ -64,30 +79,63 @@ export async function restoreBackup(file: File): Promise<{ success: boolean; mes
   }
 }
 
-async function exportDatabaseData(): Promise<Record<string, unknown>> {
+export async function exportDatabaseData(): Promise<Record<string, unknown>> {
   const db = await getDb();
-  const tables = [
-    'users', 'roles', 'permissions', 'user_permissions', 'audit_logs', 'app_settings',
-    'activities', 'fiscal_periods', 'document_sequences', 'accounts', 'journal_entries',
-    'journal_lines', 'opening_balances', 'parties', 'party_transactions', 'cashboxes',
-    'cash_transactions', 'financial_transfers', 'checks', 'invoices', 'invoice_items',
-    'payments', 'returns', 'products', 'stock_movements', 'stock_counts', 'stock_count_items',
-    'expense_categories', 'expenses', 'expense_distributions', 'income_categories', 'incomes',
-    'employees', 'attendance', 'salary_records', 'employee_advances', 'custom_fields',
-    'backup_logs', 'import_batches',
-  ];
   const data: Record<string, unknown> = { _meta: { type: 'farm-backup', version: 1, date: new Date().toISOString() } };
-  for (const table of tables) {
-    try {
-      const res = await db.query<{ row: Record<string, unknown> }>(`SELECT row_to_json(t) as row FROM ${table} t`);
-      data[table] = res.rows.map((r) => r.row);
-    } catch { /* قد لا يوجد الجدول */ }
+  for (const table of [...DATA_TABLES, ...LOG_TABLES]) {
+    const present = await db.query<{ present: boolean }>('SELECT to_regclass($1) IS NOT NULL AS present', [table]);
+    if (!present.rows[0].present) continue;
+    const res = await db.query<{ row: Record<string, unknown> }>(`SELECT row_to_json(t) as row FROM ${table} t`);
+    data[table] = res.rows.map((r) => r.row);
   }
   return data;
 }
 
-async function importDatabaseData(_data: Record<string, unknown>): Promise<void> {
-  void _data;
-  // في الإنتاج، تُستبدل هذه بآلية استعادة SQLite كاملة.
-  // هنا نسجل فقط العملية للتحقق.
+/**
+ * يستعيد الجداول الموجودة في النسخة داخل معاملة واحدة: أي خطأ يلغي الاستعادة كلها.
+ * الجداول الغائبة عن النسخة القديمة لا تُمس، بل تُحفظ صفوفها وتُعاد بعد الاستعادة
+ * حتى لا يحذفها الحذف المتتالي للجدول الأب (مثل خصومات الموظفين عند حذف الموظفين).
+ */
+async function importDatabaseData(data: Record<string, unknown>): Promise<void> {
+  const db = await getDb();
+  const tables = DATA_TABLES.filter((table) => Array.isArray(data[table]));
+
+  await db.transaction(async (tx) => {
+    const kept = new Map<string, Record<string, unknown>[]>();
+    for (const child of await findChildTablesOutside(tx, tables)) {
+      const res = await tx.query<{ row: Record<string, unknown> }>(`SELECT row_to_json(t) as row FROM ${child} t`);
+      kept.set(child, res.rows.map((r) => r.row));
+    }
+
+    for (const table of [...tables].reverse()) {
+      await tx.query(`DELETE FROM ${table}`);
+    }
+    for (const table of tables) {
+      await insertRows(tx, table, data[table] as Record<string, unknown>[]);
+    }
+    for (const [child, rows] of kept) {
+      await tx.query(`DELETE FROM ${child}`);
+      await insertRows(tx, child, rows);
+    }
+  });
+}
+
+async function findChildTablesOutside(tx: SqlRunner, tables: string[]): Promise<string[]> {
+  if (tables.length === 0) return [];
+  const inList = tables.map((t) => `'${t}'`).join(', ');
+  const res = await tx.query<{ child: string }>(
+    `SELECT DISTINCT conrelid::regclass::text AS child FROM pg_constraint
+     WHERE contype = 'f' AND confrelid::regclass::text IN (${inList})`
+  );
+  return res.rows
+    .map((r) => r.child)
+    .filter((child) => !tables.includes(child) && !LOG_TABLES.includes(child));
+}
+
+async function insertRows(tx: SqlRunner, table: string, rows: Record<string, unknown>[]): Promise<void> {
+  if (rows.length === 0) return;
+  await tx.query(
+    `INSERT INTO ${table} SELECT * FROM json_populate_recordset(NULL::${table}, $1::json)`,
+    [JSON.stringify(rows)]
+  );
 }
