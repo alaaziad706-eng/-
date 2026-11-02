@@ -7,6 +7,8 @@ import {
 import { createJournalEntry, nextDocNumber } from './accountingService';
 import { recordPartyTransaction } from './partyService';
 import { MAIN_WAREHOUSE_ID, listStockBalances } from './inventoryService';
+import { moveCashbox, resolveCashbox } from './cashboxService';
+import { listCashboxes } from './treasuryService';
 
 export interface Invoice {
   id: string;
@@ -40,7 +42,6 @@ export interface InvoiceItem {
 }
 
 const ACCOUNT_IDS = {
-  cash: 'acc_cash',
   ar: 'acc_ar',
   ap: 'acc_ap',
   sales: 'acc_sales',
@@ -212,26 +213,30 @@ export async function recordPayment(data: {
 
   // القيد: تحصيل من العميل — مدين الخزينة، دائن العميل
   // صرف للمورد — مدين المورد، دائن الخزينة
-  const lines = data.direction === 'inbound'
-    ? [{ accountId: ACCOUNT_IDS.cash, debit: data.amount, credit: 0 }, { accountId: ACCOUNT_IDS.ar, debit: 0, credit: data.amount }]
-    : [{ accountId: ACCOUNT_IDS.ap, debit: data.amount, credit: 0 }, { accountId: ACCOUNT_IDS.cash, debit: 0, credit: data.amount }];
+  const inbound = data.direction === 'inbound';
 
   await db.transaction(async (tx) => {
+    const box = await resolveCashbox(tx, data.cashboxId);
     const docNumber = await nextDocNumber('payment', tx);
+    const lines = inbound
+      ? [{ accountId: box.accountId, debit: data.amount, credit: 0 }, { accountId: ACCOUNT_IDS.ar, debit: 0, credit: data.amount }]
+      : [{ accountId: ACCOUNT_IDS.ap, debit: data.amount, credit: 0 }, { accountId: box.accountId, debit: 0, credit: data.amount }];
 
     const journal = await createJournalEntry({
       date: data.date,
-      description: data.description ?? `سند ${data.direction === 'inbound' ? 'قبض' : 'صرف'} ${docNumber}`,
+      description: data.description ?? `سند ${inbound ? 'قبض' : 'صرف'} ${docNumber}`,
       referenceType: 'payment',
       lines,
       createdBy: data.createdBy,
     }, tx);
 
     await tx.query(
-      `INSERT INTO payments (doc_number, date, invoice_id, party_id, amount, payment_method, direction, description, journal_entry_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [docNumber, data.date, data.invoiceId ?? null, data.partyId, amountCents, data.paymentMethod, data.direction, data.description ?? null, journal.id]
+      `INSERT INTO payments (doc_number, date, invoice_id, party_id, amount, payment_method, direction, cashbox_id, description, journal_entry_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [docNumber, data.date, data.invoiceId ?? null, data.partyId, amountCents, data.paymentMethod, data.direction, box.id, data.description ?? null, journal.id]
     );
+
+    await moveCashbox(tx, box.id, inbound ? amountCents : -amountCents, !inbound);
 
     if (data.invoiceId) {
       await tx.query('UPDATE invoices SET paid_amount = paid_amount + $1, updated_at = now() WHERE id = $2', [amountCents, data.invoiceId]);
@@ -268,7 +273,10 @@ export async function listSellableProducts(): Promise<SellableProduct[]> {
 
 export async function listCashboxOptions(): Promise<CashboxOption[]> {
   const desktop = getDesktopApi();
-  if (!desktop) return [];
+  if (!desktop) {
+    const rows = await listCashboxes();
+    return rows.filter((box) => box.is_active).map((box) => ({ id: box.id, name: box.name, balance: box.balance }));
+  }
   const rows = await desktop.farm.treasury.cashboxes() as { id: string; name: string; balance: number; is_active: boolean }[];
   return rows.filter((box) => box.is_active).map((box) => ({ id: box.id, name: box.name, balance: box.balance }));
 }
@@ -314,10 +322,11 @@ async function createLocalInvoice(data: Parameters<typeof createInvoice>[0]): Pr
   const db = await getDb();
   const isSales = data.docType === 'sales';
   const isCash = data.paymentMethod === 'cash';
-  const paymentAccount = isCash ? ACCOUNT_IDS.cash : isSales ? ACCOUNT_IDS.ar : ACCOUNT_IDS.ap;
   const purchaseCostsCents = isSales ? [] : allocateCents(toCents(total), items.map((i) => i.netCents));
 
   return db.transaction(async (tx) => {
+    const box = isCash ? await resolveCashbox(tx, data.cashboxId) : null;
+    const paymentAccount = box ? box.accountId : isSales ? ACCOUNT_IDS.ar : ACCOUNT_IDS.ap;
     const docNumber = await nextDocNumber(isSales ? 'sales_invoice' : 'purchase_invoice', tx);
 
     let cogsCents = 0;
@@ -367,6 +376,16 @@ async function createLocalInvoice(data: Parameters<typeof createInvoice>[0]): Pr
       lines,
       createdBy: data.createdBy,
     }, tx);
+
+    if (box) {
+      await tx.query(
+        `INSERT INTO cash_transactions (doc_number, date, type, cashbox_id, amount, party_id, activity_id, account_id, payment_method, description, journal_entry_id, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'cash', $9, $10, $11)`,
+        [docNumber, data.date, isSales ? 'receipt' : 'payment', box.id, toCents(total), data.partyId, data.activityId ?? null,
+         isSales ? ACCOUNT_IDS.sales : ACCOUNT_IDS.inventory, `فاتورة ${docNumber}`, journal.id, data.createdBy ?? null]
+      );
+      await moveCashbox(tx, box.id, isSales ? toCents(total) : -toCents(total), !isSales);
+    }
 
     const invRes = await tx.query<{ id: string }>(
       `INSERT INTO invoices (doc_number, date, doc_type, party_id, activity_id, payment_method, status, subtotal, discount, total, paid_amount, notes, journal_entry_id, created_by)

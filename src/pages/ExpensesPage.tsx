@@ -6,6 +6,7 @@ import { useSession } from '@/context/SessionContext';
 import { formatEGP, formatShortDate } from '@/lib/format';
 import { listExpenses, listIncomes, createExpense, createIncome, listExpenseCategories, listIncomeCategories, type Expense, type Income, type ExpenseCategory, type IncomeCategory } from '@/services/expensesService';
 import { listActivities, type Activity } from '@/services/activityService';
+import CashboxSelect from '@/components/treasury/CashboxSelect';
 
 export default function ExpensesPage() {
   const { hasPermission } = useSession();
@@ -99,6 +100,7 @@ function ExpenseModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   const [amount, setAmount] = useState('');
   const [activityId, setActivityId] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('cash');
+  const [cashboxId, setCashboxId] = useState('');
   const [description, setDescription] = useState('');
   const [error, setError] = useState<string | null>(null);
 
@@ -113,7 +115,7 @@ function ExpenseModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
     if (!amt || amt <= 0) { setError('أدخل مبلغًا صحيحًا'); return; }
     if (!categoryId) { setError('اختر الفئة'); return; }
     try {
-      await createExpense({ date, categoryId, amount: amt, activityId: activityId || null, paymentMethod, description, createdBy: user?.id ?? null });
+      await createExpense({ date, categoryId, amount: amt, activityId: activityId || null, paymentMethod, cashboxId, description, createdBy: user?.id ?? null });
       onSaved(); onClose();
     } catch (e) { setError(e instanceof Error ? e.message : 'خطأ'); }
   }
@@ -136,6 +138,7 @@ function ExpenseModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
             <select value={paymentMethod} onChange={(e) => setPaymentMethod(e.target.value)} className="input-base">
               <option value="cash">نقدي</option><option value="credit">آجل</option><option value="transfer">تحويل</option>
             </select></div>
+          {paymentMethod !== 'credit' && <CashboxSelect value={cashboxId} onChange={setCashboxId} />}
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">النشاط</label>
             <select value={activityId} onChange={(e) => setActivityId(e.target.value)} className="input-base">
               <option value="">— عام —</option>
@@ -161,6 +164,7 @@ function IncomeModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
   const [amount, setAmount] = useState('');
   const [activityId, setActivityId] = useState('');
+  const [cashboxId, setCashboxId] = useState('');
   const [description, setDescription] = useState('');
   const [error, setError] = useState<string | null>(null);
 
@@ -175,7 +179,7 @@ function IncomeModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
     if (!amt || amt <= 0) { setError('أدخل مبلغًا صحيحًا'); return; }
     if (!categoryId) { setError('اختر الفئة'); return; }
     try {
-      await createIncome({ date, categoryId, amount: amt, activityId: activityId || null, description, createdBy: user?.id ?? null });
+      await createIncome({ date, categoryId, amount: amt, activityId: activityId || null, cashboxId, description, createdBy: user?.id ?? null });
       onSaved(); onClose();
     } catch (e) { setError(e instanceof Error ? e.message : 'خطأ'); }
   }
@@ -194,6 +198,7 @@ function IncomeModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =>
             </select></div>
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">التاريخ</label><input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="input-base" /></div>
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">المبلغ (ج.م)</label><input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} className="input-base num" /></div>
+          <CashboxSelect value={cashboxId} onChange={setCashboxId} />
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">النشاط</label>
             <select value={activityId} onChange={(e) => setActivityId(e.target.value)} className="input-base">
               <option value="">— عام —</option>

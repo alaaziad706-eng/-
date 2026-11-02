@@ -1,5 +1,6 @@
 import { getDb, toCents, toEgp, type SqlRunner } from '@/db/db';
 import { createJournalEntry } from './accountingService';
+import { moveCashbox, resolveCashbox } from './cashboxService';
 
 export interface Employee {
   id: string;
@@ -201,7 +202,7 @@ export async function generatePayroll(data: { month: string; createdBy?: string 
   });
 }
 
-export async function paySalary(id: string, createdBy?: string | null): Promise<void> {
+export async function paySalary(id: string, createdBy?: string | null, cashboxId?: string): Promise<void> {
   const db = await getDb();
   await db.transaction(async (tx) => {
     const record = await tx.query<{ net_salary: number; status: string }>(
@@ -210,6 +211,7 @@ export async function paySalary(id: string, createdBy?: string | null): Promise<
     if (record.rows.length === 0) throw new Error('السجل غير موجود');
     const r = record.rows[0];
     if (r.status !== 'pending') throw new Error('الراتب مدفوع بالفعل');
+    const box = await resolveCashbox(tx, cashboxId);
 
     await createJournalEntry({
       date: new Date().toISOString().slice(0, 10),
@@ -217,11 +219,12 @@ export async function paySalary(id: string, createdBy?: string | null): Promise<
       referenceType: 'salary',
       lines: [
         { accountId: 'acc_salaries_pay', debit: toEgp(r.net_salary), credit: 0 },
-        { accountId: 'acc_cash', debit: 0, credit: toEgp(r.net_salary) },
+        { accountId: box.accountId, debit: 0, credit: toEgp(r.net_salary) },
       ],
       createdBy,
     }, tx);
 
+    await moveCashbox(tx, box.id, -Number(r.net_salary), true);
     await tx.query("UPDATE salary_records SET status = 'paid', paid_at = now() WHERE id = $1", [id]);
   });
 }
@@ -308,22 +311,24 @@ export async function listAdvances(): Promise<EmployeeAdvance[]> {
 }
 
 export async function createAdvance(data: {
-  employeeId: string; date: string; amount: number; repaymentMethod?: string; installmentAmount?: number; createdBy?: string | null;
+  employeeId: string; date: string; amount: number; repaymentMethod?: string; installmentAmount?: number; cashboxId?: string; createdBy?: string | null;
 }): Promise<void> {
   if (data.amount <= 0) throw new Error('المبلغ يجب أن يكون أكبر من صفر');
   const db = await getDb();
   await db.transaction(async (tx) => {
+    const box = await resolveCashbox(tx, data.cashboxId);
     const journal = await createJournalEntry({
       date: data.date,
       description: `سلفة موظف`,
       referenceType: 'advance',
       lines: [
         { accountId: 'acc_advances_emp', debit: data.amount, credit: 0 },
-        { accountId: 'acc_cash', debit: 0, credit: data.amount },
+        { accountId: box.accountId, debit: 0, credit: data.amount },
       ],
       createdBy: data.createdBy,
     }, tx);
 
+    await moveCashbox(tx, box.id, -toCents(data.amount), true);
     await tx.query(
       `INSERT INTO employee_advances (employee_id, date, amount, repayment_method, installment_amount, total_paid, remaining, status, journal_entry_id)
        VALUES ($1, $2, $3, $4, $5, 0, $3, 'active', $6)`,

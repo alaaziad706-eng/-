@@ -5,7 +5,7 @@ import { createJournalEntry } from '@/services/accountingService';
 import { createInvoice } from '@/services/invoiceService';
 import { createParty } from '@/services/partyService';
 import { createEmployee, createAdvance, generatePayroll, paySalary, listSalaryRecords, listAdvances } from '@/services/employeeService';
-import { createTestDatabase } from './testDatabase';
+import { createTestDatabase, fundMainCashbox } from './testDatabase';
 
 let db: PGlite;
 
@@ -108,6 +108,7 @@ describe('sales and purchases', () => {
   });
 
   it('purchase updates weighted average cost and debits inventory', async () => {
+    await fundMainCashbox(100000);
     await seedProduct('p2', 0, 0);
     const party = await createParty({ name: 'مورد', type: 'supplier' });
 
@@ -131,7 +132,7 @@ describe('sales and purchases', () => {
     });
     assert.deepEqual(await productRow('p2'), { quantity: 20, avg_cost: 600 });
     assert.equal(await accountBalance('acc_inventory'), 12000);
-    assert.equal(await accountBalance('acc_cash'), -12000);
+    assert.equal(await accountBalance('acc_cash'), 10000000 - 12000);
     await assertLedgerBalanced();
   });
 
@@ -158,6 +159,7 @@ describe('sales and purchases', () => {
 
 describe('payroll', () => {
   it('accrues salary once per month, does not duplicate on regenerate, and pay clears the payable', async () => {
+    await fundMainCashbox(100000);
     const emp = await createEmployee({ name: 'أحمد', baseSalary: 3000, salaryType: 'monthly' });
 
     await generatePayroll({ month: '2026-10' });
@@ -172,7 +174,7 @@ describe('payroll', () => {
 
     await paySalary(records[0].id);
     assert.equal(await accountBalance('acc_salaries_pay'), 0);
-    assert.equal(await accountBalance('acc_cash'), -300000);
+    assert.equal(await accountBalance('acc_cash'), 10000000 - 300000);
     assert.equal(await accountBalance('acc_salaries'), 300000);
     await assertLedgerBalanced();
 
@@ -183,6 +185,7 @@ describe('payroll', () => {
   });
 
   it('recovers advance installments from salary and settles the advance', async () => {
+    await fundMainCashbox(100000);
     const emp = await createEmployee({ name: 'محمد', baseSalary: 3000, salaryType: 'monthly' });
     await createAdvance({ employeeId: emp.id, date: '2026-10-01', amount: 1000, repaymentMethod: 'installment', installmentAmount: 400 });
 
@@ -205,6 +208,7 @@ describe('payroll', () => {
   });
 
   it('caps advance recovery at the salary so net pay is never negative', async () => {
+    await fundMainCashbox(100000);
     const emp = await createEmployee({ name: 'علي', baseSalary: 500, salaryType: 'monthly' });
     await createAdvance({ employeeId: emp.id, date: '2026-10-01', amount: 2000, repaymentMethod: 'lump_sum', installmentAmount: 0 });
 
@@ -212,7 +216,7 @@ describe('payroll', () => {
     const records = await listSalaryRecords('2026-10');
     assert.equal(records[0].advance_deduct, 50000);
     assert.equal(records[0].net_salary, 0);
-    assert.equal(await count('journal_entries'), 2);
+    assert.equal(await count('journal_entries'), 3);
     await assertLedgerBalanced();
   });
 });

@@ -7,7 +7,7 @@ import { createParty } from '@/services/partyService';
 import { createExpense, createIncome } from '@/services/expensesService';
 import { createCheck, createTransfer } from '@/services/financeService';
 import { createCashTransaction } from '@/services/treasuryService';
-import { createTestDatabase } from './testDatabase';
+import { createTestDatabase, fundMainCashbox } from './testDatabase';
 
 let db: PGlite;
 
@@ -40,7 +40,7 @@ async function failInsertsInto(table: string): Promise<void> {
 }
 
 async function seedCashbox(id: string): Promise<void> {
-  await db.query('INSERT INTO cashboxes (id, name) VALUES ($1, $2)', [id, 'الخزينة الرئيسية']);
+  await db.query("INSERT INTO cashboxes (id, name, account_id) VALUES ($1, $2, 'acc_cash')", [id, 'الخزينة الرئيسية']);
 }
 
 async function cashboxBalance(id: string): Promise<number> {
@@ -84,12 +84,13 @@ describe('recordPayment atomicity', () => {
 
 describe('expense and income atomicity', () => {
   it('posts expense journal and record together', async () => {
+    await fundMainCashbox(100000);
     await createExpense({ date: '2026-10-05', categoryId: 'ec_admin', amount: 30, paymentMethod: 'cash' });
 
     assert.equal(await count('expenses'), 1);
-    assert.equal(await count('journal_entries'), 1);
+    assert.equal(await count('journal_entries'), 2);
     assert.equal(await accountBalance('acc_admin'), 3000);
-    assert.equal(await accountBalance('acc_cash'), -3000);
+    assert.equal(await accountBalance('acc_cash'), 10000000 - 3000);
     await assertLedgerBalanced();
   });
 

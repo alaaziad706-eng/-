@@ -1,5 +1,6 @@
-import { getDb, toCents } from '@/db/db';
+import { getDb, toCents, type SqlRunner } from '@/db/db';
 import { createJournalEntry, nextDocNumber } from './accountingService';
+import { ensureDefaultCashbox, moveCashbox, resolveCashbox } from './cashboxService';
 
 export interface Cashbox {
   id: string;
@@ -23,13 +24,10 @@ export interface CashTransaction {
   description: string | null;
 }
 
-export async function ensureDefaultCashbox(): Promise<void> {
-  const db = await getDb();
-  const res = await db.query<{ count: number }>('SELECT count(*) as count FROM cashboxes');
-  if (res.rows[0].count === 0) {
-    await db.query('INSERT INTO cashboxes (name, opening_balance, balance) VALUES ($1, 0, 0)', ['الخزينة الرئيسية']);
-  }
-}
+export type CashMovementType = 'receipt' | 'payment' | 'deposit' | 'withdrawal' | 'opening';
+
+export const DEPOSIT_SOURCE_ACCOUNTS = ['acc_bank', 'acc_capital', 'acc_other_income'];
+const WITHDRAWAL_BANK_ACCOUNT = 'acc_bank';
 
 export async function listCashboxes(): Promise<Cashbox[]> {
   await ensureDefaultCashbox();
@@ -55,10 +53,25 @@ export async function listCashTransactions(limit = 100, filters?: { type?: strin
   return res.rows;
 }
 
+async function assertWithdrawalAccount(runner: SqlRunner, accountId: string): Promise<void> {
+  if (accountId === WITHDRAWAL_BANK_ACCOUNT) return;
+  const res = await runner.query<{ type: string; is_active: boolean }>(
+    'SELECT type, is_active FROM accounts WHERE id = $1',
+    [accountId]
+  );
+  const row = res.rows[0];
+  if (!row || !row.is_active || row.type !== 'expense') throw new Error('حساب السحب غير صالح');
+}
+
+function assertDepositSource(accountId: string): void {
+  if (!DEPOSIT_SOURCE_ACCOUNTS.includes(accountId)) throw new Error('مصدر الإيداع غير صالح');
+}
+
 export async function createCashTransaction(data: {
   date: string;
-  type: 'receipt' | 'payment' | 'deposit' | 'withdrawal' | 'opening';
-  cashboxId: string;
+  type: CashMovementType;
+  cashboxId?: string;
+  counterAccountId?: string;
   amount: number;
   partyId?: string | null;
   activityId?: string | null;
@@ -68,21 +81,31 @@ export async function createCashTransaction(data: {
 }): Promise<{ id: string; docNumber: string }> {
   if (data.amount <= 0) throw new Error('المبلغ يجب أن يكون أكبر من صفر');
   const db = await getDb();
-  const docType = data.type === 'receipt' ? 'receipt' : data.type === 'payment' ? 'payment' : 'receipt';
   const amountCents = toCents(data.amount);
-  const isReceipt = data.type === 'receipt' || data.type === 'deposit' || data.type === 'opening';
+  const isInflow = data.type === 'receipt' || data.type === 'deposit' || data.type === 'opening';
 
   return db.transaction(async (tx) => {
-    const docNumber = await nextDocNumber(docType, tx);
+    const box = await resolveCashbox(tx, data.cashboxId);
 
-    // القيد: قبض — مدين الخزينة، دائن الطرف/الحساب | صرف — مدين المصروف، دائن الخزينة
-    const lines = isReceipt
-      ? [{ accountId: 'acc_cash', debit: data.amount, credit: 0 }, { accountId: 'acc_ar', debit: 0, credit: data.amount }]
-      : [{ accountId: 'acc_admin', debit: data.amount, credit: 0 }, { accountId: 'acc_cash', debit: 0, credit: data.amount }];
+    let counterAccount: string;
+    if (data.type === 'receipt') counterAccount = 'acc_ar';
+    else if (data.type === 'payment') counterAccount = 'acc_ap';
+    else if (data.type === 'opening') counterAccount = 'acc_capital';
+    else {
+      if (!data.counterAccountId) throw new Error('اختر الحساب المقابل');
+      if (data.type === 'deposit') assertDepositSource(data.counterAccountId);
+      else await assertWithdrawalAccount(tx, data.counterAccountId);
+      counterAccount = data.counterAccountId;
+    }
+
+    const docNumber = await nextDocNumber(isInflow ? 'receipt' : 'payment', tx);
+    const lines = isInflow
+      ? [{ accountId: box.accountId, debit: data.amount, credit: 0 }, { accountId: counterAccount, debit: 0, credit: data.amount }]
+      : [{ accountId: counterAccount, debit: data.amount, credit: 0 }, { accountId: box.accountId, debit: 0, credit: data.amount }];
 
     const journal = await createJournalEntry({
       date: data.date,
-      description: data.description ?? `سند ${isReceipt ? 'قبض' : 'صرف'} ${docNumber}`,
+      description: data.description ?? `سند ${isInflow ? 'قبض' : 'صرف'} ${docNumber}`,
       referenceType: 'cash',
       activityId: data.activityId,
       lines,
@@ -90,15 +113,62 @@ export async function createCashTransaction(data: {
     }, tx);
 
     const res = await tx.query<{ id: string }>(
-      `INSERT INTO cash_transactions (doc_number, date, type, cashbox_id, amount, party_id, activity_id, payment_method, description, journal_entry_id, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
-      [docNumber, data.date, data.type, data.cashboxId, amountCents, data.partyId ?? null, data.activityId ?? null,
+      `INSERT INTO cash_transactions (doc_number, date, type, cashbox_id, amount, party_id, activity_id, account_id, payment_method, description, journal_entry_id, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+      [docNumber, data.date, data.type, box.id, amountCents, data.partyId ?? null, data.activityId ?? null, counterAccount,
        data.paymentMethod ?? 'cash', data.description ?? null, journal.id, data.createdBy ?? null]
     );
 
-    const delta = isReceipt ? amountCents : -amountCents;
-    await tx.query('UPDATE cashboxes SET balance = balance + $1, updated_at = now() WHERE id = $2', [delta, data.cashboxId]);
+    await moveCashbox(tx, box.id, isInflow ? amountCents : -amountCents, !isInflow);
 
     return { id: res.rows[0].id, docNumber };
+  });
+}
+
+export async function transferBetweenCashboxes(data: {
+  date: string;
+  fromCashboxId: string;
+  toCashboxId: string;
+  amount: number;
+  description?: string;
+  createdBy?: string | null;
+}): Promise<{ docNumber: string }> {
+  if (data.amount <= 0) throw new Error('المبلغ يجب أن يكون أكبر من صفر');
+  if (data.fromCashboxId === data.toCashboxId) throw new Error('لا يمكن التحويل إلى نفس الخزينة');
+  const db = await getDb();
+  const amountCents = toCents(data.amount);
+
+  return db.transaction(async (tx) => {
+    const from = await resolveCashbox(tx, data.fromCashboxId);
+    const to = await resolveCashbox(tx, data.toCashboxId);
+    const docNumber = await nextDocNumber('transfer', tx);
+    const inDocNumber = await nextDocNumber('transfer', tx);
+
+    const journal = await createJournalEntry({
+      date: data.date,
+      description: data.description ?? `تحويل بين الخزائن ${docNumber}`,
+      referenceType: 'cash_transfer',
+      lines: [
+        { accountId: to.accountId, debit: data.amount, credit: 0 },
+        { accountId: from.accountId, debit: 0, credit: data.amount },
+      ],
+      createdBy: data.createdBy,
+    }, tx);
+
+    await tx.query(
+      `INSERT INTO cash_transactions (doc_number, date, type, cashbox_id, amount, account_id, payment_method, description, journal_entry_id, created_by)
+       VALUES ($1, $2, 'transfer_out', $3, $4, $5, 'cash', $6, $7, $8)`,
+      [docNumber, data.date, from.id, amountCents, to.accountId, data.description ?? null, journal.id, data.createdBy ?? null]
+    );
+    await tx.query(
+      `INSERT INTO cash_transactions (doc_number, date, type, cashbox_id, amount, account_id, payment_method, description, journal_entry_id, created_by)
+       VALUES ($1, $2, 'transfer_in', $3, $4, $5, 'cash', $6, $7, $8)`,
+      [inDocNumber, data.date, to.id, amountCents, from.accountId, data.description ?? null, journal.id, data.createdBy ?? null]
+    );
+
+    await moveCashbox(tx, from.id, -amountCents, true);
+    await moveCashbox(tx, to.id, amountCents, false);
+
+    return { docNumber };
   });
 }

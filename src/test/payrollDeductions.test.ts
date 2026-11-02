@@ -5,7 +5,7 @@ import {
   createEmployee, createAdvance, generatePayroll, paySalary,
   listSalaryRecords, listAdvances, listDeductions, recordDeduction,
 } from '@/services/employeeService';
-import { createTestDatabase } from './testDatabase';
+import { createTestDatabase, fundMainCashbox } from './testDatabase';
 
 let db: PGlite;
 
@@ -65,6 +65,7 @@ describe('employee deductions', () => {
   });
 
   it('deducts both penalties and advance installments from net pay', async () => {
+    await fundMainCashbox(100000);
     const emp = await createEmployee({ name: 'ياسر', baseSalary: 3000, salaryType: 'monthly' });
     await createAdvance({ employeeId: emp.id, date: '2026-10-01', amount: 1000, repaymentMethod: 'installment', installmentAmount: 400 });
     await recordDeduction({ employeeId: emp.id, month: '2026-10', amount: 200, reason: 'تلف معدات' });
@@ -125,6 +126,7 @@ describe('employee deductions', () => {
   });
 
   it('pays the reduced net salary and clears the payable', async () => {
+    await fundMainCashbox(100000);
     const emp = await createEmployee({ name: 'عمر', baseSalary: 3000, salaryType: 'monthly' });
     await recordDeduction({ employeeId: emp.id, month: '2026-10', amount: 200, reason: 'غياب' });
     await generatePayroll({ month: '2026-10' });
@@ -133,7 +135,7 @@ describe('employee deductions', () => {
     await paySalary(record.id);
 
     assert.equal(await accountBalance('acc_salaries_pay'), 0);
-    assert.equal(await accountBalance('acc_cash'), -280000);
+    assert.equal(await accountBalance('acc_cash'), 10000000 - 280000);
     assert.equal(await accountBalance('acc_salaries'), 280000);
     const [paid] = await listSalaryRecords('2026-10');
     assert.equal(paid.status, 'paid');

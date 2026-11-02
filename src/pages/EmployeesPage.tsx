@@ -13,6 +13,7 @@ import {
 } from '@/services/employeeService';
 import { listActivities, type Activity } from '@/services/activityService';
 import DeductionsTab from '@/components/employees/DeductionsTab';
+import CashboxSelect from '@/components/treasury/CashboxSelect';
 
 type Tab = 'employees' | 'attendance' | 'salaries' | 'advances' | 'deductions';
 
@@ -219,6 +220,7 @@ function SalariesTab({ canAdd }: { canAdd: boolean }) {
   const { user } = useSession();
   const [records, setRecords] = useState<SalaryRecord[]>([]);
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [cashboxId, setCashboxId] = useState('');
 
   const load = useCallback(() => listSalaryRecords(month).then(setRecords), [month]);
   useEffect(() => { load(); }, [load]);
@@ -227,6 +229,7 @@ function SalariesTab({ canAdd }: { canAdd: boolean }) {
     <div className="space-y-4">
       <div className="card p-4 flex items-end gap-3">
         <div><label className="text-sm font-semibold text-slate-700 mb-1 block">الشهر</label><input type="month" value={month} onChange={(e) => setMonth(e.target.value)} className="input-base" /></div>
+        <div className="min-w-48"><CashboxSelect value={cashboxId} onChange={setCashboxId} label="خزينة الصرف" /></div>
         {canAdd && <button onClick={async () => { await generatePayroll({ month, createdBy: user?.id ?? null }); load(); }} className="btn-primary">إنشاء مسير</button>}
       </div>
       <div className="card overflow-hidden">
@@ -250,7 +253,7 @@ function SalariesTab({ canAdd }: { canAdd: boolean }) {
                     <td className="px-4 py-3 num font-semibold text-slate-700">{formatEGP(r.net_salary / 100)}</td>
                     <td className="px-4 py-3">{r.status === 'paid' ? <Badge tone="emerald" dot>مدفوع</Badge> : <Badge tone="amber" dot>معلق</Badge>}</td>
                     <td className="px-4 py-3">
-                      {r.status === 'pending' && canAdd && <button onClick={async () => { await paySalary(r.id, user?.id ?? null); load(); }} className="btn-secondary text-xs py-1">صرف</button>}
+                      {r.status === 'pending' && canAdd && <button onClick={async () => { await paySalary(r.id, user?.id ?? null, cashboxId); load(); }} className="btn-secondary text-xs py-1">صرف</button>}
                     </td>
                   </tr>
                 ))}
@@ -314,6 +317,7 @@ function AdvanceModal({ employees, onClose, onSaved }: { employees: Employee[]; 
   const [empId, setEmpId] = useState('');
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
   const [amount, setAmount] = useState('');
+  const [cashboxId, setCashboxId] = useState('');
   const [error, setError] = useState<string | null>(null);
 
   async function handleSave() {
@@ -322,7 +326,7 @@ function AdvanceModal({ employees, onClose, onSaved }: { employees: Employee[]; 
     if (!empId) { setError('اختر الموظف'); return; }
     if (!amt || amt <= 0) { setError('أدخل مبلغًا صحيحًا'); return; }
     try {
-      await createAdvance({ employeeId: empId, date, amount: amt, createdBy: user?.id ?? null });
+      await createAdvance({ employeeId: empId, date, amount: amt, cashboxId, createdBy: user?.id ?? null });
       onSaved(); onClose();
     } catch (e) { setError(e instanceof Error ? e.message : 'خطأ'); }
   }
@@ -342,6 +346,7 @@ function AdvanceModal({ employees, onClose, onSaved }: { employees: Employee[]; 
             </select></div>
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">التاريخ</label><input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="input-base" /></div>
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">المبلغ (ج.م)</label><input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} className="input-base num" /></div>
+          <CashboxSelect value={cashboxId} onChange={setCashboxId} />
           {error && <div className="flex items-center gap-2 text-sm text-rose-600"><AlertCircle className="h-4 w-4" />{error}</div>}
         </div>
         <div className="flex gap-2 mt-5">

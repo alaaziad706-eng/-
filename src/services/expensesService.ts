@@ -1,5 +1,6 @@
 import { getDb, toCents } from '@/db/db';
 import { createJournalEntry } from './accountingService';
+import { moveCashbox, resolveCashbox } from './cashboxService';
 
 export interface ExpenseCategory {
   id: string;
@@ -74,6 +75,7 @@ export async function createExpense(data: {
   amount: number;
   activityId?: string | null;
   paymentMethod?: string;
+  cashboxId?: string;
   description?: string;
   isShared?: boolean;
   createdBy?: string | null;
@@ -81,15 +83,15 @@ export async function createExpense(data: {
   if (data.amount <= 0) throw new Error('المبلغ يجب أن يكون أكبر من صفر');
   const db = await getDb();
 
-  // جلب حساب الفئة
   const catRes = await db.query<{ account_id: string; name: string }>('SELECT account_id, name FROM expense_categories WHERE id = $1', [data.categoryId]);
   if (catRes.rows.length === 0) throw new Error('الفئة غير موجودة');
   const accountId = catRes.rows[0].account_id ?? 'acc_admin';
   const catName = catRes.rows[0].name;
+  const isCredit = data.paymentMethod === 'credit';
+  const amountCents = toCents(data.amount);
 
-  // القيد: مدين المصروف، دائن الخزينة (نقدي) أو الموردين (آجل)
-  const creditAccount = data.paymentMethod === 'credit' ? 'acc_ap' : 'acc_cash';
   await db.transaction(async (tx) => {
+    const box = isCredit ? null : await resolveCashbox(tx, data.cashboxId);
     await createJournalEntry({
       date: data.date,
       description: data.description ?? `مصروف: ${catName}`,
@@ -97,17 +99,19 @@ export async function createExpense(data: {
       activityId: data.activityId,
       lines: [
         { accountId, debit: data.amount, credit: 0 },
-        { accountId: creditAccount, debit: 0, credit: data.amount },
+        { accountId: box ? box.accountId : 'acc_ap', debit: 0, credit: data.amount },
       ],
       createdBy: data.createdBy,
     }, tx);
 
     await tx.query(
-      `INSERT INTO expenses (doc_number, date, category_id, account_id, amount, activity_id, payment_method, description, is_shared)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [Date.now().toString(), data.date, data.categoryId, accountId, toCents(data.amount), data.activityId ?? null,
-       data.paymentMethod ?? 'cash', data.description ?? null, data.isShared ?? false]
+      `INSERT INTO expenses (doc_number, date, category_id, account_id, amount, activity_id, payment_method, cashbox_id, description, is_shared)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [Date.now().toString(), data.date, data.categoryId, accountId, amountCents, data.activityId ?? null,
+       data.paymentMethod ?? 'cash', box?.id ?? null, data.description ?? null, data.isShared ?? false]
     );
+
+    if (box) await moveCashbox(tx, box.id, -amountCents, true);
   });
 }
 
@@ -117,6 +121,7 @@ export async function createIncome(data: {
   amount: number;
   activityId?: string | null;
   paymentMethod?: string;
+  cashboxId?: string;
   description?: string;
   createdBy?: string | null;
 }): Promise<void> {
@@ -127,26 +132,30 @@ export async function createIncome(data: {
   if (catRes.rows.length === 0) throw new Error('الفئة غير موجودة');
   const accountId = catRes.rows[0].account_id ?? 'acc_sales';
   const catName = catRes.rows[0].name;
+  const isCredit = data.paymentMethod === 'credit';
+  const amountCents = toCents(data.amount);
 
-  const debitAccount = data.paymentMethod === 'credit' ? 'acc_ar' : 'acc_cash';
   await db.transaction(async (tx) => {
+    const box = isCredit ? null : await resolveCashbox(tx, data.cashboxId);
     await createJournalEntry({
       date: data.date,
       description: data.description ?? `إيراد: ${catName}`,
       referenceType: 'income',
       activityId: data.activityId,
       lines: [
-        { accountId: debitAccount, debit: data.amount, credit: 0 },
+        { accountId: box ? box.accountId : 'acc_ar', debit: data.amount, credit: 0 },
         { accountId, debit: 0, credit: data.amount },
       ],
       createdBy: data.createdBy,
     }, tx);
 
     await tx.query(
-      `INSERT INTO incomes (doc_number, date, category_id, account_id, amount, activity_id, payment_method, description)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [Date.now().toString(), data.date, data.categoryId, accountId, toCents(data.amount), data.activityId ?? null,
-       data.paymentMethod ?? 'cash', data.description ?? null]
+      `INSERT INTO incomes (doc_number, date, category_id, account_id, amount, activity_id, payment_method, cashbox_id, description)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [Date.now().toString(), data.date, data.categoryId, accountId, amountCents, data.activityId ?? null,
+       data.paymentMethod ?? 'cash', box?.id ?? null, data.description ?? null]
     );
+
+    if (box) await moveCashbox(tx, box.id, amountCents, false);
   });
 }
