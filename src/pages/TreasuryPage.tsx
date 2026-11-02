@@ -109,11 +109,16 @@ export default function TreasuryPage() {
   );
 }
 
-function counterAccountOptions(type: ModalType, accounts: Account[]): Account[] {
-  if (type === 'deposit') return accounts.filter((a) => DEPOSIT_SOURCE_ACCOUNTS.includes(a.id) && a.is_active);
-  if (type === 'withdrawal') return accounts.filter((a) => a.is_active && (a.id === 'acc_bank' || a.type === 'expense'));
+function counterAccountOptions(movementType: CashMovementType, accounts: Account[]): Account[] {
+  if (movementType === 'deposit') return accounts.filter((a) => DEPOSIT_SOURCE_ACCOUNTS.includes(a.id) && a.is_active);
+  if (movementType === 'withdrawal') return accounts.filter((a) => a.is_active && (a.id === 'acc_bank' || a.type === 'expense'));
   return [];
 }
+
+const WITHDRAWAL_KIND_OPTIONS: { value: 'withdrawal' | 'partner_drawing'; label: string }[] = [
+  { value: 'withdrawal', label: 'سحب من حساب' },
+  { value: 'partner_drawing', label: 'مسحوبات شريك' },
+];
 
 function CashModal({ type, onClose, onSaved }: { type: ModalType; onClose: () => void; onSaved: () => void }) {
   const { user } = useSession();
@@ -129,20 +134,24 @@ function CashModal({ type, onClose, onSaved }: { type: ModalType; onClose: () =>
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  const needsCounter = type === 'deposit' || type === 'withdrawal';
-  const counterOptions = counterAccountOptions(type, accounts);
+  const [withdrawalKind, setWithdrawalKind] = useState<'withdrawal' | 'partner_drawing'>('withdrawal');
+  const movementType: CashMovementType = type === 'withdrawal' ? withdrawalKind : type;
+  const needsCounter = movementType === 'deposit' || movementType === 'withdrawal';
+  const counterOptions = counterAccountOptions(movementType, accounts);
 
   useEffect(() => {
     listCashboxes().then((cb) => { setCashboxes(cb); if (cb[0]) setCashboxId(cb[0].id); })
       .catch((e: unknown) => setError(e instanceof Error ? e.message : 'تعذر تحميل الخزائن'));
     listActivities().then(setActivities);
-    if (needsCounter) {
-      listAccounts().then((rows) => {
-        setAccounts(rows);
-        setCounterAccountId(counterAccountOptions(type, rows)[0]?.id ?? '');
-      }).catch((e: unknown) => setError(e instanceof Error ? e.message : 'تعذر تحميل الحسابات'));
-    }
-  }, [needsCounter, type]);
+  }, []);
+
+  useEffect(() => {
+    if (!needsCounter) return;
+    listAccounts().then((rows) => {
+      setAccounts(rows);
+      setCounterAccountId(counterAccountOptions(movementType, rows)[0]?.id ?? '');
+    }).catch((e: unknown) => setError(e instanceof Error ? e.message : 'تعذر تحميل الحسابات'));
+  }, [needsCounter, movementType]);
 
   async function handleSave() {
     setError(null);
@@ -153,7 +162,7 @@ function CashModal({ type, onClose, onSaved }: { type: ModalType; onClose: () =>
     setSaving(true);
     try {
       await createCashTransaction({
-        date, type, cashboxId, amount: amt, description, activityId: activityId || null,
+        date, type: movementType, cashboxId, amount: amt, description, activityId: activityId || null,
         counterAccountId: needsCounter ? counterAccountId : undefined, createdBy: user?.id ?? null,
       });
       onSaved(); onClose();
@@ -169,13 +178,20 @@ function CashModal({ type, onClose, onSaved }: { type: ModalType; onClose: () =>
           <button onClick={onClose} className="btn-ghost p-1.5"><X className="h-4 w-4" /></button>
         </div>
         <div className="space-y-3">
+          {type === 'withdrawal' && (
+            <div><label className="text-sm font-semibold text-slate-700 mb-1 block">نوع السحب</label>
+              <select value={withdrawalKind} onChange={(e) => setWithdrawalKind(e.target.value as 'withdrawal' | 'partner_drawing')} className="input-base">
+                {WITHDRAWAL_KIND_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+              </select>
+            </div>
+          )}
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">الخزينة</label>
             <select value={cashboxId} onChange={(e) => setCashboxId(e.target.value)} className="input-base">
               {cashboxes.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
           </div>
           {needsCounter && (
-            <div><label className="text-sm font-semibold text-slate-700 mb-1 block">{type === 'deposit' ? 'مصدر الإيداع' : 'جهة الصرف'}</label>
+            <div><label className="text-sm font-semibold text-slate-700 mb-1 block">{movementType === 'deposit' ? 'مصدر الإيداع' : 'جهة الصرف'}</label>
               <select value={counterAccountId} onChange={(e) => setCounterAccountId(e.target.value)} className="input-base">
                 {counterOptions.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
               </select>
