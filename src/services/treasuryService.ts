@@ -69,34 +69,36 @@ export async function createCashTransaction(data: {
   if (data.amount <= 0) throw new Error('المبلغ يجب أن يكون أكبر من صفر');
   const db = await getDb();
   const docType = data.type === 'receipt' ? 'receipt' : data.type === 'payment' ? 'payment' : 'receipt';
-  const docNumber = await nextDocNumber(docType);
   const amountCents = toCents(data.amount);
-
-  // القيد: قبض — مدين الخزينة، دائن الطرف/الحساب | صرف — مدين المصروف، دائن الخزينة
   const isReceipt = data.type === 'receipt' || data.type === 'deposit' || data.type === 'opening';
-  const lines = isReceipt
-    ? [{ accountId: 'acc_cash', debit: data.amount, credit: 0 }, { accountId: 'acc_ar', debit: 0, credit: data.amount }]
-    : [{ accountId: 'acc_admin', debit: data.amount, credit: 0 }, { accountId: 'acc_cash', debit: 0, credit: data.amount }];
 
-  const journal = await createJournalEntry({
-    date: data.date,
-    description: data.description ?? `سند ${isReceipt ? 'قبض' : 'صرف'} ${docNumber}`,
-    referenceType: 'cash',
-    activityId: data.activityId,
-    lines,
-    createdBy: data.createdBy,
+  return db.transaction(async (tx) => {
+    const docNumber = await nextDocNumber(docType, tx);
+
+    // القيد: قبض — مدين الخزينة، دائن الطرف/الحساب | صرف — مدين المصروف، دائن الخزينة
+    const lines = isReceipt
+      ? [{ accountId: 'acc_cash', debit: data.amount, credit: 0 }, { accountId: 'acc_ar', debit: 0, credit: data.amount }]
+      : [{ accountId: 'acc_admin', debit: data.amount, credit: 0 }, { accountId: 'acc_cash', debit: 0, credit: data.amount }];
+
+    const journal = await createJournalEntry({
+      date: data.date,
+      description: data.description ?? `سند ${isReceipt ? 'قبض' : 'صرف'} ${docNumber}`,
+      referenceType: 'cash',
+      activityId: data.activityId,
+      lines,
+      createdBy: data.createdBy,
+    }, tx);
+
+    const res = await tx.query<{ id: string }>(
+      `INSERT INTO cash_transactions (doc_number, date, type, cashbox_id, amount, party_id, activity_id, payment_method, description, journal_entry_id, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
+      [docNumber, data.date, data.type, data.cashboxId, amountCents, data.partyId ?? null, data.activityId ?? null,
+       data.paymentMethod ?? 'cash', data.description ?? null, journal.id, data.createdBy ?? null]
+    );
+
+    const delta = isReceipt ? amountCents : -amountCents;
+    await tx.query('UPDATE cashboxes SET balance = balance + $1, updated_at = now() WHERE id = $2', [delta, data.cashboxId]);
+
+    return { id: res.rows[0].id, docNumber };
   });
-
-  const res = await db.query<{ id: string }>(
-    `INSERT INTO cash_transactions (doc_number, date, type, cashbox_id, amount, party_id, activity_id, payment_method, description, journal_entry_id, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id`,
-    [docNumber, data.date, data.type, data.cashboxId, amountCents, data.partyId ?? null, data.activityId ?? null,
-     data.paymentMethod ?? 'cash', data.description ?? null, journal.id, data.createdBy ?? null]
-  );
-
-  // تحديث رصيد الخزينة
-  const delta = isReceipt ? amountCents : -amountCents;
-  await db.query('UPDATE cashboxes SET balance = balance + $1, updated_at = now() WHERE id = $2', [delta, data.cashboxId]);
-
-  return { id: res.rows[0].id, docNumber };
 }

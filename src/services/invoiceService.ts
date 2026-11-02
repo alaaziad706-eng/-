@@ -208,7 +208,6 @@ export async function recordPayment(data: {
   }
 
   const db = await getDb();
-  const docNumber = await nextDocNumber('payment');
   const amountCents = toCents(data.amount);
 
   // القيد: تحصيل من العميل — مدين الخزينة، دائن العميل
@@ -217,31 +216,33 @@ export async function recordPayment(data: {
     ? [{ accountId: ACCOUNT_IDS.cash, debit: data.amount, credit: 0 }, { accountId: ACCOUNT_IDS.ar, debit: 0, credit: data.amount }]
     : [{ accountId: ACCOUNT_IDS.ap, debit: data.amount, credit: 0 }, { accountId: ACCOUNT_IDS.cash, debit: 0, credit: data.amount }];
 
-  const journal = await createJournalEntry({
-    date: data.date,
-    description: data.description ?? `سند ${data.direction === 'inbound' ? 'قبض' : 'صرف'} ${docNumber}`,
-    referenceType: 'payment',
-    lines,
-    createdBy: data.createdBy,
-  });
+  await db.transaction(async (tx) => {
+    const docNumber = await nextDocNumber('payment', tx);
 
-  await db.query(
-    `INSERT INTO payments (doc_number, date, invoice_id, party_id, amount, payment_method, direction, description, journal_entry_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [docNumber, data.date, data.invoiceId ?? null, data.partyId, amountCents, data.paymentMethod, data.direction, data.description ?? null, journal.id]
-  );
+    const journal = await createJournalEntry({
+      date: data.date,
+      description: data.description ?? `سند ${data.direction === 'inbound' ? 'قبض' : 'صرف'} ${docNumber}`,
+      referenceType: 'payment',
+      lines,
+      createdBy: data.createdBy,
+    }, tx);
 
-  // تحديث المبلغ المدفوع في الفاتورة
-  if (data.invoiceId) {
-    await db.query('UPDATE invoices SET paid_amount = paid_amount + $1, updated_at = now() WHERE id = $2', [amountCents, data.invoiceId]);
-  }
+    await tx.query(
+      `INSERT INTO payments (doc_number, date, invoice_id, party_id, amount, payment_method, direction, description, journal_entry_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [docNumber, data.date, data.invoiceId ?? null, data.partyId, amountCents, data.paymentMethod, data.direction, data.description ?? null, journal.id]
+    );
 
-  // حركة الطرف
-  await recordPartyTransaction({
-    partyId: data.partyId, date: data.date, type: 'payment', referenceType: 'payment', referenceId: docNumber,
-    debit: data.direction === 'outbound' ? data.amount : 0,
-    credit: data.direction === 'inbound' ? data.amount : 0,
-    description: data.description ?? `سداد ${docNumber}`,
+    if (data.invoiceId) {
+      await tx.query('UPDATE invoices SET paid_amount = paid_amount + $1, updated_at = now() WHERE id = $2', [amountCents, data.invoiceId]);
+    }
+
+    await recordPartyTransaction({
+      partyId: data.partyId, date: data.date, type: 'payment', referenceType: 'payment', referenceId: docNumber,
+      debit: data.direction === 'outbound' ? data.amount : 0,
+      credit: data.direction === 'inbound' ? data.amount : 0,
+      description: data.description ?? `سداد ${docNumber}`,
+    }, tx);
   });
 }
 

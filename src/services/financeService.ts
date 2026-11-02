@@ -47,31 +47,34 @@ export async function createCheck(data: {
 }): Promise<{ id: string; docNumber: string }> {
   if (data.amount <= 0) throw new Error('المبلغ يجب أن يكون أكبر من صفر');
   const db = await getDb();
-  const docNumber = await nextDocNumber(data.direction === 'incoming' ? 'check_in' : 'check_out');
   const amountCents = toCents(data.amount);
 
-  const lines = data.direction === 'incoming'
-    ? [{ accountId: 'acc_checks_recv', debit: data.amount, credit: 0 }, { accountId: 'acc_ar', debit: 0, credit: data.amount }]
-    : [{ accountId: 'acc_ap', debit: data.amount, credit: 0 }, { accountId: 'acc_checks_pay', debit: 0, credit: data.amount }];
+  return db.transaction(async (tx) => {
+    const docNumber = await nextDocNumber(data.direction === 'incoming' ? 'check_in' : 'check_out', tx);
 
-  const journal = await createJournalEntry({
-    date: data.date,
-    description: data.description ?? `شيك ${data.direction === 'incoming' ? 'وارد' : 'صادر'} ${docNumber}`,
-    referenceType: 'check',
-    activityId: data.activityId,
-    lines,
-    createdBy: data.createdBy,
+    const lines = data.direction === 'incoming'
+      ? [{ accountId: 'acc_checks_recv', debit: data.amount, credit: 0 }, { accountId: 'acc_ar', debit: 0, credit: data.amount }]
+      : [{ accountId: 'acc_ap', debit: data.amount, credit: 0 }, { accountId: 'acc_checks_pay', debit: 0, credit: data.amount }];
+
+    const journal = await createJournalEntry({
+      date: data.date,
+      description: data.description ?? `شيك ${data.direction === 'incoming' ? 'وارد' : 'صادر'} ${docNumber}`,
+      referenceType: 'check',
+      activityId: data.activityId,
+      lines,
+      createdBy: data.createdBy,
+    }, tx);
+
+    const res = await tx.query<{ id: string }>(
+      `INSERT INTO checks (doc_number, check_number, bank_name, direction, party_id, amount, issue_date, due_date, activity_id, status, description, journal_entry_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
+      [docNumber, data.checkNumber ?? null, data.bankName ?? null, data.direction, data.partyId ?? null, amountCents,
+       data.issueDate ?? null, data.dueDate, data.activityId ?? null, data.direction === 'incoming' ? 'received' : 'issued',
+       data.description ?? null, journal.id]
+    );
+
+    return { id: res.rows[0].id, docNumber };
   });
-
-  const res = await db.query<{ id: string }>(
-    `INSERT INTO checks (doc_number, check_number, bank_name, direction, party_id, amount, issue_date, due_date, activity_id, status, description, journal_entry_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id`,
-    [docNumber, data.checkNumber ?? null, data.bankName ?? null, data.direction, data.partyId ?? null, amountCents,
-     data.issueDate ?? null, data.dueDate, data.activityId ?? null, data.direction === 'incoming' ? 'received' : 'issued',
-     data.description ?? null, journal.id]
-  );
-
-  return { id: res.rows[0].id, docNumber };
 }
 
 export async function updateCheckStatus(id: string, status: string): Promise<void> {
@@ -117,27 +120,30 @@ export async function createTransfer(data: {
 }): Promise<{ id: string; docNumber: string }> {
   if (data.amount <= 0) throw new Error('المبلغ يجب أن يكون أكبر من صفر');
   const db = await getDb();
-  const docNumber = await nextDocNumber('transfer');
 
-  const lines = data.direction === 'inbound'
-    ? [{ accountId: 'acc_bank', debit: data.amount, credit: 0 }, { accountId: 'acc_ar', debit: 0, credit: data.amount }]
-    : [{ accountId: 'acc_ap', debit: data.amount, credit: 0 }, { accountId: 'acc_bank', debit: 0, credit: data.amount }];
+  return db.transaction(async (tx) => {
+    const docNumber = await nextDocNumber('transfer', tx);
 
-  const journal = await createJournalEntry({
-    date: data.date,
-    description: data.description ?? `تحويل ${data.direction === 'inbound' ? 'وارد' : 'صادر'} ${docNumber}`,
-    referenceType: 'transfer',
-    activityId: data.activityId,
-    lines,
-    createdBy: data.createdBy,
+    const lines = data.direction === 'inbound'
+      ? [{ accountId: 'acc_bank', debit: data.amount, credit: 0 }, { accountId: 'acc_ar', debit: 0, credit: data.amount }]
+      : [{ accountId: 'acc_ap', debit: data.amount, credit: 0 }, { accountId: 'acc_bank', debit: 0, credit: data.amount }];
+
+    const journal = await createJournalEntry({
+      date: data.date,
+      description: data.description ?? `تحويل ${data.direction === 'inbound' ? 'وارد' : 'صادر'} ${docNumber}`,
+      referenceType: 'transfer',
+      activityId: data.activityId,
+      lines,
+      createdBy: data.createdBy,
+    }, tx);
+
+    const res = await tx.query<{ id: string }>(
+      `INSERT INTO financial_transfers (doc_number, ref_number, date, direction, amount, party_id, activity_id, method, status, description, journal_entry_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'completed', $9, $10) RETURNING id`,
+      [docNumber, data.refNumber ?? null, data.date, data.direction, toCents(data.amount), data.partyId ?? null,
+       data.activityId ?? null, data.method ?? 'bank_transfer', data.description ?? null, journal.id]
+    );
+
+    return { id: res.rows[0].id, docNumber };
   });
-
-  const res = await db.query<{ id: string }>(
-    `INSERT INTO financial_transfers (doc_number, ref_number, date, direction, amount, party_id, activity_id, method, status, description, journal_entry_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'completed', $9, $10) RETURNING id`,
-    [docNumber, data.refNumber ?? null, data.date, data.direction, toCents(data.amount), data.partyId ?? null,
-     data.activityId ?? null, data.method ?? 'bank_transfer', data.description ?? null, journal.id]
-  );
-
-  return { id: res.rows[0].id, docNumber };
 }

@@ -130,37 +130,38 @@ async function postJournalEntry(db: SqlRunner, data: JournalEntryInput): Promise
 // ===================== قيد عكسي (إلغاء) =====================
 export async function reverseJournalEntry(entryId: string, date: string, createdBy?: string | null): Promise<void> {
   const db = await getDb();
-  const entry = await db.query<JournalEntry>(
-    `SELECT id, entry_number, date, description, reference_type, reference_id, activity_id, status FROM journal_entries WHERE id = $1`,
-    [entryId]
-  );
-  if (entry.rows.length === 0) throw new Error('القيد غير موجود');
-  if (entry.rows[0].status === 'reversed') throw new Error('القيد ملغى بالفعل');
+  await db.transaction(async (tx) => {
+    const entry = await tx.query<JournalEntry>(
+      `SELECT id, entry_number, date, description, reference_type, reference_id, activity_id, status FROM journal_entries WHERE id = $1 FOR UPDATE`,
+      [entryId]
+    );
+    if (entry.rows.length === 0) throw new Error('القيد غير موجود');
+    if (entry.rows[0].status === 'reversed') throw new Error('القيد ملغى بالفعل');
 
-  const lines = await db.query<{ account_id: string; debit: number; credit: number; description: string | null }>(
-    'SELECT account_id, debit, credit, description FROM journal_lines WHERE entry_id = $1',
-    [entryId]
-  );
+    const lines = await tx.query<{ account_id: string; debit: number; credit: number; description: string | null }>(
+      'SELECT account_id, debit, credit, description FROM journal_lines WHERE entry_id = $1',
+      [entryId]
+    );
 
-  // قيد عكسي: عكس المدين والدائن
-  const revLines = lines.rows.map((l) => ({
-    accountId: l.account_id,
-    debit: toEgp(l.credit),
-    credit: toEgp(l.debit),
-    description: `قيد عكسي — ${l.description ?? ''}`,
-  }));
+    const revLines = lines.rows.map((l) => ({
+      accountId: l.account_id,
+      debit: toEgp(Number(l.credit)),
+      credit: toEgp(Number(l.debit)),
+      description: `قيد عكسي — ${l.description ?? ''}`,
+    }));
 
-  await createJournalEntry({
-    date,
-    description: `قيد عكسي لـ ${entry.rows[0].entry_number}`,
-    referenceType: 'reversal',
-    referenceId: entryId,
-    activityId: entry.rows[0].activity_id,
-    lines: revLines,
-    createdBy,
+    await createJournalEntry({
+      date,
+      description: `قيد عكسي لـ ${entry.rows[0].entry_number}`,
+      referenceType: 'reversal',
+      referenceId: entryId,
+      activityId: entry.rows[0].activity_id,
+      lines: revLines,
+      createdBy,
+    }, tx);
+
+    await tx.query("UPDATE journal_entries SET status = 'reversed' WHERE id = $1", [entryId]);
   });
-
-  await db.query("UPDATE journal_entries SET status = 'reversed' WHERE id = $1", [entryId]);
 }
 
 // ===================== القيود اليومية =====================

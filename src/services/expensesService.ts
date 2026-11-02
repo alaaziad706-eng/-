@@ -89,24 +89,26 @@ export async function createExpense(data: {
 
   // القيد: مدين المصروف، دائن الخزينة (نقدي) أو الموردين (آجل)
   const creditAccount = data.paymentMethod === 'credit' ? 'acc_ap' : 'acc_cash';
-  await createJournalEntry({
-    date: data.date,
-    description: data.description ?? `مصروف: ${catName}`,
-    referenceType: 'expense',
-    activityId: data.activityId,
-    lines: [
-      { accountId, debit: data.amount, credit: 0 },
-      { accountId: creditAccount, debit: 0, credit: data.amount },
-    ],
-    createdBy: data.createdBy,
-  });
+  await db.transaction(async (tx) => {
+    await createJournalEntry({
+      date: data.date,
+      description: data.description ?? `مصروف: ${catName}`,
+      referenceType: 'expense',
+      activityId: data.activityId,
+      lines: [
+        { accountId, debit: data.amount, credit: 0 },
+        { accountId: creditAccount, debit: 0, credit: data.amount },
+      ],
+      createdBy: data.createdBy,
+    }, tx);
 
-  await db.query(
-    `INSERT INTO expenses (doc_number, date, category_id, account_id, amount, activity_id, payment_method, description, is_shared)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [Date.now().toString(), data.date, data.categoryId, accountId, toCents(data.amount), data.activityId ?? null,
-     data.paymentMethod ?? 'cash', data.description ?? null, data.isShared ?? false]
-  );
+    await tx.query(
+      `INSERT INTO expenses (doc_number, date, category_id, account_id, amount, activity_id, payment_method, description, is_shared)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [Date.now().toString(), data.date, data.categoryId, accountId, toCents(data.amount), data.activityId ?? null,
+       data.paymentMethod ?? 'cash', data.description ?? null, data.isShared ?? false]
+    );
+  });
 }
 
 export async function createIncome(data: {
@@ -127,22 +129,24 @@ export async function createIncome(data: {
   const catName = catRes.rows[0].name;
 
   const debitAccount = data.paymentMethod === 'credit' ? 'acc_ar' : 'acc_cash';
-  await createJournalEntry({
-    date: data.date,
-    description: data.description ?? `إيراد: ${catName}`,
-    referenceType: 'income',
-    activityId: data.activityId,
-    lines: [
-      { accountId: debitAccount, debit: data.amount, credit: 0 },
-      { accountId, debit: 0, credit: data.amount },
-    ],
-    createdBy: data.createdBy,
-  });
+  await db.transaction(async (tx) => {
+    await createJournalEntry({
+      date: data.date,
+      description: data.description ?? `إيراد: ${catName}`,
+      referenceType: 'income',
+      activityId: data.activityId,
+      lines: [
+        { accountId: debitAccount, debit: data.amount, credit: 0 },
+        { accountId, debit: 0, credit: data.amount },
+      ],
+      createdBy: data.createdBy,
+    }, tx);
 
-  await db.query(
-    `INSERT INTO incomes (doc_number, date, category_id, account_id, amount, activity_id, payment_method, description)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-    [Date.now().toString(), data.date, data.categoryId, accountId, toCents(data.amount), data.activityId ?? null,
-     data.paymentMethod ?? 'cash', data.description ?? null]
-  );
+    await tx.query(
+      `INSERT INTO incomes (doc_number, date, category_id, account_id, amount, activity_id, payment_method, description)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [Date.now().toString(), data.date, data.categoryId, accountId, toCents(data.amount), data.activityId ?? null,
+       data.paymentMethod ?? 'cash', data.description ?? null]
+    );
+  });
 }
