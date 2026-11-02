@@ -15,7 +15,7 @@ import { listActivities, type Activity } from '@/services/activityService';
 
 const TYPE_LABELS: Record<string, string> = {
   receipt: 'سند قبض', payment: 'سند صرف', deposit: 'إيداع', withdrawal: 'سحب', opening: 'رصيد افتتاحي',
-  transfer_in: 'تحويل وارد', transfer_out: 'تحويل صادر',
+  transfer_in: 'تحويل وارد', transfer_out: 'تحويل صادر', partner_drawing: 'مسحوبات شريك',
 };
 
 const INFLOW_TYPES = ['receipt', 'deposit', 'opening', 'transfer_in'];

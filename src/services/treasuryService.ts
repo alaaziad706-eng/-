@@ -24,10 +24,11 @@ export interface CashTransaction {
   description: string | null;
 }
 
-export type CashMovementType = 'receipt' | 'payment' | 'deposit' | 'withdrawal' | 'opening';
+export type CashMovementType = 'receipt' | 'payment' | 'deposit' | 'withdrawal' | 'opening' | 'partner_drawing';
 
 export const DEPOSIT_SOURCE_ACCOUNTS = ['acc_bank', 'acc_capital', 'acc_other_income'];
 const WITHDRAWAL_BANK_ACCOUNT = 'acc_bank';
+const PARTNER_DRAWINGS_ACCOUNT = 'acc_partner_drawings';
 
 export async function listCashboxes(): Promise<Cashbox[]> {
   await ensureDefaultCashbox();
@@ -91,6 +92,7 @@ export async function createCashTransaction(data: {
     if (data.type === 'receipt') counterAccount = 'acc_ar';
     else if (data.type === 'payment') counterAccount = 'acc_ap';
     else if (data.type === 'opening') counterAccount = 'acc_capital';
+    else if (data.type === 'partner_drawing') counterAccount = PARTNER_DRAWINGS_ACCOUNT;
     else {
       if (!data.counterAccountId) throw new Error('اختر الحساب المقابل');
       if (data.type === 'deposit') assertDepositSource(data.counterAccountId);
