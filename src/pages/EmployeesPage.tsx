@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { UserCircle, Plus, X, AlertCircle, Calendar, Banknote, HandCoins } from 'lucide-react';
+import { UserCircle, Plus, X, AlertCircle, Calendar, Banknote, HandCoins, MinusCircle } from 'lucide-react';
 import PageHeader from '@/components/ui/PageHeader';
 import EmptyState from '@/components/ui/EmptyState';
 import Badge from '@/components/ui/Badge';
@@ -12,8 +12,9 @@ import {
   type Employee, type SalaryRecord, type EmployeeAdvance, type Attendance,
 } from '@/services/employeeService';
 import { listActivities, type Activity } from '@/services/activityService';
+import DeductionsTab from '@/components/employees/DeductionsTab';
 
-type Tab = 'employees' | 'attendance' | 'salaries' | 'advances';
+type Tab = 'employees' | 'attendance' | 'salaries' | 'advances' | 'deductions';
 
 export default function EmployeesPage() {
   const { hasPermission } = useSession();
@@ -24,6 +25,7 @@ export default function EmployeesPage() {
     { id: 'attendance', label: 'الحضور', icon: Calendar },
     { id: 'salaries', label: 'الرواتب', icon: Banknote },
     { id: 'advances', label: 'السلف', icon: HandCoins },
+    { id: 'deductions', label: 'الخصومات', icon: MinusCircle },
   ];
 
   return (
@@ -45,6 +47,7 @@ export default function EmployeesPage() {
       {tab === 'attendance' && <AttendanceTab />}
       {tab === 'salaries' && <SalariesTab canAdd={hasPermission('employees.add')} />}
       {tab === 'advances' && <AdvancesTab canAdd={hasPermission('employees.add')} />}
+      {tab === 'deductions' && <DeductionsTab canAdd={hasPermission('employees.add')} />}
     </div>
   );
 }
@@ -224,7 +227,7 @@ function SalariesTab({ canAdd }: { canAdd: boolean }) {
     <div className="space-y-4">
       <div className="card p-4 flex items-end gap-3">
         <div><label className="text-sm font-semibold text-slate-700 mb-1 block">الشهر</label><input type="month" value={month} onChange={(e) => setMonth(e.target.value)} className="input-base" /></div>
-        {canAdd && <button onClick={async () => { await generatePayroll({ month: month + '-01', createdBy: user?.id ?? null }); load(); }} className="btn-primary">إنشاء مسير</button>}
+        {canAdd && <button onClick={async () => { await generatePayroll({ month, createdBy: user?.id ?? null }); load(); }} className="btn-primary">إنشاء مسير</button>}
       </div>
       <div className="card overflow-hidden">
         {records.length === 0 ? (
@@ -234,7 +237,7 @@ function SalariesTab({ canAdd }: { canAdd: boolean }) {
             <table className="w-full text-sm">
               <thead><tr className="border-b border-slate-100 bg-slate-50/60 text-slate-500">
                 <th className="px-4 py-3 text-right font-semibold">الموظف</th><th className="px-4 py-3 text-right font-semibold">الشهر</th>
-                <th className="px-4 py-3 text-right font-semibold">الأساسي</th><th className="px-4 py-3 text-right font-semibold">الصافي</th>
+                <th className="px-4 py-3 text-right font-semibold">الأساسي</th><th className="px-4 py-3 text-right font-semibold">الخصومات</th><th className="px-4 py-3 text-right font-semibold">الصافي</th>
                 <th className="px-4 py-3 text-right font-semibold">الحالة</th><th className="px-4 py-3 text-right font-semibold">إجراء</th>
               </tr></thead>
               <tbody>
@@ -243,6 +246,7 @@ function SalariesTab({ canAdd }: { canAdd: boolean }) {
                     <td className="px-4 py-3 text-slate-700 font-semibold">{r.employee_name}</td>
                     <td className="px-4 py-3 num text-slate-600">{formatShortDate(r.month)}</td>
                     <td className="px-4 py-3 num text-slate-600">{formatEGP(r.base_salary / 100)}</td>
+                    <td className="px-4 py-3 num text-rose-600">{formatEGP(r.deductions / 100)}</td>
                     <td className="px-4 py-3 num font-semibold text-slate-700">{formatEGP(r.net_salary / 100)}</td>
                     <td className="px-4 py-3">{r.status === 'paid' ? <Badge tone="emerald" dot>مدفوع</Badge> : <Badge tone="amber" dot>معلق</Badge>}</td>
                     <td className="px-4 py-3">
