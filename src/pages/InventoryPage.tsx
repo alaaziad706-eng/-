@@ -5,13 +5,14 @@ import EmptyState from '@/components/ui/EmptyState';
 import Badge from '@/components/ui/Badge';
 import { useSession } from '@/context/SessionContext';
 import { formatEGP } from '@/lib/format';
-import { listProducts, createProduct, recordStockMovement, listStockMovements, getCategoryLabel, type Product, type StockMovement } from '@/services/inventoryService';
+import { listProducts, createProduct, receiveStock, issueStock, listStockMovements, CATEGORY_LABELS, MAIN_WAREHOUSE_ID } from '@/services/inventoryService';
+import type { DesktopProductRow, DesktopStockMovementRow } from '@/lib/electronBridge';
 import { listActivities, type Activity } from '@/services/activityService';
 
 export default function InventoryPage() {
   const { hasPermission } = useSession();
-  const [products, setProducts] = useState<Product[]>([]);
-  const [movements, setMovements] = useState<StockMovement[]>([]);
+  const [products, setProducts] = useState<DesktopProductRow[]>([]);
+  const [movements, setMovements] = useState<DesktopStockMovementRow[]>([]);
   const [showProductModal, setShowProductModal] = useState(false);
   const [showMovementModal, setShowMovementModal] = useState(false);
   const [movementType, setMovementType] = useState<'in' | 'out'>('in');
@@ -22,8 +23,8 @@ export default function InventoryPage() {
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const lowStock = products.filter((p) => p.quantity <= p.reorder_level);
-  const totalValue = products.reduce((s, p) => s + (p.quantity * p.avg_cost / 100), 0);
+  const lowStock = products.filter((p) => p.is_low_stock);
+  const totalValue = products.reduce((s, p) => s + p.total_value / 100, 0);
 
   return (
     <div>
@@ -61,11 +62,11 @@ export default function InventoryPage() {
                   {products.map((p) => (
                     <tr key={p.id} className="border-b border-slate-50 last:border-0 hover:bg-slate-50/50">
                       <td className="px-4 py-2 text-slate-700 font-semibold">{p.name}</td>
-                      <td className="px-4 py-2"><Badge tone="slate">{getCategoryLabel(p.category)}</Badge></td>
-                      <td className="px-4 py-2 num text-slate-600">{p.quantity} {p.unit}</td>
-                      <td className="px-4 py-2 num text-slate-600">{formatEGP(p.avg_cost / 100)}</td>
+                      <td className="px-4 py-2"><Badge tone="slate">{CATEGORY_LABELS[p.category ?? 'other'] ?? p.category}</Badge></td>
+                      <td className="px-4 py-2 num text-slate-600">{p.quantity_milli / 1000} {p.unit}</td>
+                      <td className="px-4 py-2 num text-slate-600">{formatEGP(p.unit_cost / 100)}</td>
                       <td className="px-4 py-2">
-                        {p.quantity <= p.reorder_level
+                        {p.is_low_stock
                           ? <span className="inline-flex items-center gap-1 text-xs text-amber-600"><AlertTriangle className="h-3 w-3" /> منخفض</span>
                           : <Badge tone="emerald" dot>متوفر</Badge>}
                       </td>
@@ -95,7 +96,7 @@ export default function InventoryPage() {
                       <td className="px-4 py-2 num text-slate-600">{m.date}</td>
                       <td className="px-4 py-2 text-slate-700">{m.product_name}</td>
                       <td className="px-4 py-2"><Badge tone={m.direction === 'in' ? 'emerald' : 'rose'}>{m.direction === 'in' ? 'وارد' : 'صادر'}</Badge></td>
-                      <td className="px-4 py-2 num text-slate-600">{m.direction === 'in' ? '+' : '−'}{m.quantity}</td>
+                      <td className="px-4 py-2 num text-slate-600">{m.direction === 'in' ? '+' : '−'}{m.quantity_milli / 1000}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -165,8 +166,7 @@ function ProductModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   );
 }
 
-function MovementModal({ type, products, onClose, onSaved }: { type: 'in' | 'out'; products: Product[]; activities: Activity[]; onClose: () => void; onSaved: () => void }) {
-  const { user } = useSession();
+function MovementModal({ type, products, onClose, onSaved }: { type: 'in' | 'out'; products: DesktopProductRow[]; activities: Activity[]; onClose: () => void; onSaved: () => void }) {
   const [productId, setProductId] = useState('');
   const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
   const [quantity, setQuantity] = useState('');
@@ -184,10 +184,9 @@ function MovementModal({ type, products, onClose, onSaved }: { type: 'in' | 'out
     const cost = parseFloat(unitCost) || 0;
     if (!qty || qty <= 0) { setError('أدخل كمية صحيحة'); return; }
     try {
-      await recordStockMovement({
-        date, productId, type: type === 'in' ? 'purchase' : 'issue', direction: type,
-        quantity: qty, unitCost: cost, activityId: activityId || null, createdBy: user?.id ?? null,
-      });
+      const form = { date, productId, warehouseId: MAIN_WAREHOUSE_ID, quantity: qty, activityId: activityId || null, notes: null };
+      if (type === 'in') await receiveStock({ ...form, unitCostPounds: cost });
+      else await issueStock(form);
       onSaved(); onClose();
     } catch (e) { setError(e instanceof Error ? e.message : 'خطأ'); }
   }
@@ -203,7 +202,7 @@ function MovementModal({ type, products, onClose, onSaved }: { type: 'in' | 'out
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">الصنف</label>
             <select value={productId} onChange={(e) => setProductId(e.target.value)} className="input-base">
               <option value="">اختر</option>
-              {products.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.quantity} {p.unit})</option>)}
+              {products.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.quantity_milli / 1000} {p.unit})</option>)}
             </select></div>
           <div><label className="text-sm font-semibold text-slate-700 mb-1 block">التاريخ</label><input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="input-base" /></div>
           <div className="grid grid-cols-2 gap-3">

@@ -72,4 +72,13 @@ export async function resetDatabase(): Promise<void> {
   await getDb();
 }
 
+/** الاستعلام داخل قاعدة البيانات أو داخل معاملة (transaction) */
+export type SqlRunner = Pick<PGlite, 'query'>;
+
+/** حقن قاعدة بيانات بديلة (مثلاً PGlite في الذاكرة) — للاختبارات فقط */
+export function setDbForTesting(db: PGlite): void {
+  dbInstance = db;
+  initPromise = null;
+}
+
 export type { PGlite };

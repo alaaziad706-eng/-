@@ -1,4 +1,4 @@
-import { getDb, toCents } from '@/db/db';
+import { getDb, toCents, type SqlRunner } from '@/db/db';
 import {
   getDesktopApi,
   type DesktopPartyRow,
@@ -219,8 +219,8 @@ export async function recordPartyTransaction(data: {
   debit?: number;
   credit?: number;
   description?: string;
-}): Promise<void> {
-  const db = await getDb();
+}, runner?: SqlRunner): Promise<void> {
+  const db = runner ?? (await getDb());
   await db.query(
     `INSERT INTO party_transactions (party_id, date, type, reference_type, reference_id, debit, credit, description)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,

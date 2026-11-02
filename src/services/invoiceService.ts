@@ -1,4 +1,4 @@
-import { getDb, toCents } from '@/db/db';
+import { getDb, toCents, toEgp } from '@/db/db';
 import {
   getDesktopApi,
   type DesktopInvoiceItemRow,
@@ -157,79 +157,7 @@ export async function createInvoice(data: {
     return { id: result.id, docNumber: result.docNumber };
   }
 
-  const db = await getDb();
-
-  // حساب الإجماليات (بالجنيه)
-  const subtotal = data.items.reduce((s, i) => s + i.quantity * i.unitPrice, 0);
-  const itemsDiscount = data.items.reduce((s, i) => s + i.discount, 0);
-  const total = subtotal - itemsDiscount - data.discount;
-  if (total <= 0) throw new Error('إجمالي الفاتورة يجب أن يكون أكبر من صفر');
-
-  const docNumber = await nextDocNumber(data.docType === 'sales' ? 'sales_invoice'
-    : data.docType === 'purchase' ? 'purchase_invoice'
-    : data.docType === 'sales_return' ? 'sales_return'
-    : 'purchase_return');
-
-  // إنشاء القيد المحاسبي
-  const isCash = data.paymentMethod === 'cash';
-
-  let lines: { accountId: string; debit: number; credit: number }[];
-  if (data.docType === 'sales') {
-    if (isCash) lines = [{ accountId: ACCOUNT_IDS.cash, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.sales, debit: 0, credit: total }];
-    else lines = [{ accountId: ACCOUNT_IDS.ar, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.sales, debit: 0, credit: total }];
-  } else if (data.docType === 'purchase') {
-    if (isCash) lines = [{ accountId: ACCOUNT_IDS.cogs, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.cash, debit: 0, credit: total }];
-    else lines = [{ accountId: ACCOUNT_IDS.cogs, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.ap, debit: 0, credit: total }];
-  } else if (data.docType === 'sales_return') {
-    if (isCash) lines = [{ accountId: ACCOUNT_IDS.salesReturns, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.cash, debit: 0, credit: total }];
-    else lines = [{ accountId: ACCOUNT_IDS.salesReturns, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.ar, debit: 0, credit: total }];
-  } else {
-    // purchase_return
-    if (isCash) lines = [{ accountId: ACCOUNT_IDS.cash, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.purchaseReturns, debit: 0, credit: total }];
-    else lines = [{ accountId: ACCOUNT_IDS.ap, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.purchaseReturns, debit: 0, credit: total }];
-  }
-
-  const journal = await createJournalEntry({
-    date: data.date,
-    description: `${docTypeLabel(data.docType)} ${docNumber}`,
-    referenceType: 'invoice',
-    activityId: data.activityId,
-    lines,
-    createdBy: data.createdBy,
-  });
-
-  // حفظ الفاتورة
-  const invRes = await db.query<{ id: string }>(
-    `INSERT INTO invoices (doc_number, date, doc_type, party_id, activity_id, payment_method, status, subtotal, discount, total, paid_amount, notes, journal_entry_id, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, 'posted', $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
-    [docNumber, data.date, data.docType, data.partyId, data.activityId ?? null, data.paymentMethod,
-     toCents(subtotal), toCents(itemsDiscount + data.discount), toCents(total),
-     isCash ? toCents(total) : 0, data.notes ?? null, journal.id, data.createdBy ?? null]
-  );
-  const invoiceId = invRes.rows[0].id;
-
-  // حفظ البنود
-  for (const item of data.items) {
-    const itemTotal = item.quantity * item.unitPrice - item.discount;
-    await db.query(
-      `INSERT INTO invoice_items (invoice_id, product_id, description, quantity, unit, unit_price, discount, total)
-       VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)`,
-      [invoiceId, item.description, item.quantity, item.unit, toCents(item.unitPrice), toCents(item.discount), toCents(itemTotal)]
-    );
-  }
-
-  // حركة الطرف
-  if (data.docType === 'sales' && !isCash) {
-    await recordPartyTransaction({ partyId: data.partyId, date: data.date, type: 'invoice', referenceType: 'invoice', referenceId: invoiceId, debit: total, description: `فاتورة مبيعات ${docNumber}` });
-  } else if (data.docType === 'purchase' && !isCash) {
-    await recordPartyTransaction({ partyId: data.partyId, date: data.date, type: 'invoice', referenceType: 'invoice', referenceId: invoiceId, credit: total, description: `فاتورة مشتريات ${docNumber}` });
-  } else if (data.docType === 'sales_return' && !isCash) {
-    await recordPartyTransaction({ partyId: data.partyId, date: data.date, type: 'return', referenceType: 'invoice', referenceId: invoiceId, credit: total, description: `مرتجع مبيعات ${docNumber}` });
-  } else if (data.docType === 'purchase_return' && !isCash) {
-    await recordPartyTransaction({ partyId: data.partyId, date: data.date, type: 'return', referenceType: 'invoice', referenceId: invoiceId, debit: total, description: `مرتجع مشتريات ${docNumber}` });
-  }
-
-  return { id: invoiceId, docNumber };
+  return createLocalInvoice(data);
 }
 
 export interface ReturnInput {
@@ -348,6 +276,131 @@ export async function cancelInvoice(invoiceId: string, date: string): Promise<{ 
   const desktop = getDesktopApi();
   if (!desktop) throw new Error('إلغاء الفواتير متاح من تطبيق سطح المكتب فقط');
   return desktop.farm.invoices.cancel({ invoiceId, date });
+}
+
+const QTY_EPSILON = 1e-9;
+
+function roundQty(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+function allocateCents(totalCents: number, weights: number[]): number[] {
+  const weightSum = weights.reduce((s, w) => s + w, 0);
+  if (weightSum <= 0) throw new Error('إجمالي البنود يجب أن يكون أكبر من صفر');
+  let remaining = totalCents;
+  return weights.map((w, index) => {
+    const share = index === weights.length - 1 ? remaining : Math.round((totalCents * w) / weightSum);
+    remaining -= share;
+    return share;
+  });
+}
+
+async function createLocalInvoice(data: Parameters<typeof createInvoice>[0]): Promise<{ id: string; docNumber: string }> {
+  if (data.docType !== 'sales' && data.docType !== 'purchase') throw new Error('المرتجع يُسجَّل من الفاتورة الأصلية');
+  if (data.items.length === 0) throw new Error('أضف بندًا واحدًا على الأقل');
+
+  const items = data.items.map((item) => {
+    if (!item.productId) throw new Error('اختر الصنف من المخزون لكل بند');
+    if (!(item.quantity > 0)) throw new Error('الكمية يجب أن تكون أكبر من صفر');
+    return { ...item, productId: item.productId, netCents: toCents(item.quantity * item.unitPrice - item.discount) };
+  });
+
+  const subtotal = items.reduce((s, i) => s + i.quantity * i.unitPrice, 0);
+  const itemsDiscount = items.reduce((s, i) => s + i.discount, 0);
+  const total = subtotal - itemsDiscount - data.discount;
+  if (total <= 0) throw new Error('إجمالي الفاتورة يجب أن يكون أكبر من صفر');
+
+  const db = await getDb();
+  const isSales = data.docType === 'sales';
+  const isCash = data.paymentMethod === 'cash';
+  const paymentAccount = isCash ? ACCOUNT_IDS.cash : isSales ? ACCOUNT_IDS.ar : ACCOUNT_IDS.ap;
+  const purchaseCostsCents = isSales ? [] : allocateCents(toCents(total), items.map((i) => i.netCents));
+
+  return db.transaction(async (tx) => {
+    const docNumber = await nextDocNumber(isSales ? 'sales_invoice' : 'purchase_invoice', tx);
+
+    let cogsCents = 0;
+    const movements: { productId: string; type: 'sale' | 'purchase'; direction: 'in' | 'out'; quantity: number; unitCost: number; balanceAfter: number }[] = [];
+    for (const [index, item] of items.entries()) {
+      const productRes = await tx.query<{ name: string; quantity: number; avg_cost: number }>(
+        'SELECT name, quantity, avg_cost FROM products WHERE id = $1',
+        [item.productId]
+      );
+      if (productRes.rows.length === 0) throw new Error('الصنف غير موجود في المخزون');
+      const product = productRes.rows[0];
+      const stock = Number(product.quantity);
+      const avgCost = Number(product.avg_cost);
+
+      let newQty: number;
+      let newAvg: number;
+      if (isSales) {
+        if (item.quantity > stock + QTY_EPSILON) {
+          throw new Error(`الكمية المتاحة من "${product.name}" ${roundQty(stock)} فقط`);
+        }
+        cogsCents += Math.round(item.quantity * avgCost);
+        newQty = roundQty(stock - item.quantity);
+        newAvg = avgCost;
+        movements.push({ productId: item.productId, type: 'sale', direction: 'out', quantity: item.quantity, unitCost: avgCost, balanceAfter: newQty });
+      } else {
+        const lineCost = purchaseCostsCents[index];
+        newQty = roundQty(stock + item.quantity);
+        newAvg = Math.round((stock * avgCost + lineCost) / newQty);
+        movements.push({ productId: item.productId, type: 'purchase', direction: 'in', quantity: item.quantity, unitCost: Math.round(lineCost / item.quantity), balanceAfter: newQty });
+      }
+
+      await tx.query('UPDATE products SET quantity = $1, avg_cost = $2, updated_at = now() WHERE id = $3', [newQty, newAvg, item.productId]);
+    }
+
+    const lines: { accountId: string; debit: number; credit: number }[] = isSales
+      ? [{ accountId: paymentAccount, debit: total, credit: 0 }, { accountId: ACCOUNT_IDS.sales, debit: 0, credit: total }]
+      : [{ accountId: ACCOUNT_IDS.inventory, debit: total, credit: 0 }, { accountId: paymentAccount, debit: 0, credit: total }];
+    if (isSales && cogsCents > 0) {
+      lines.push({ accountId: ACCOUNT_IDS.cogs, debit: toEgp(cogsCents), credit: 0 }, { accountId: ACCOUNT_IDS.inventory, debit: 0, credit: toEgp(cogsCents) });
+    }
+
+    const journal = await createJournalEntry({
+      date: data.date,
+      description: `${docTypeLabel(data.docType)} ${docNumber}`,
+      referenceType: 'invoice',
+      activityId: data.activityId,
+      lines,
+      createdBy: data.createdBy,
+    }, tx);
+
+    const invRes = await tx.query<{ id: string }>(
+      `INSERT INTO invoices (doc_number, date, doc_type, party_id, activity_id, payment_method, status, subtotal, discount, total, paid_amount, notes, journal_entry_id, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, 'posted', $7, $8, $9, $10, $11, $12, $13) RETURNING id`,
+      [docNumber, data.date, data.docType, data.partyId, data.activityId ?? null, data.paymentMethod,
+       toCents(subtotal), toCents(itemsDiscount + data.discount), toCents(total),
+       isCash ? toCents(total) : 0, data.notes ?? null, journal.id, data.createdBy ?? null]
+    );
+    const invoiceId = invRes.rows[0].id;
+
+    for (const [index, item] of items.entries()) {
+      await tx.query(
+        `INSERT INTO invoice_items (invoice_id, product_id, description, quantity, unit, unit_price, discount, total)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [invoiceId, item.productId, item.description, item.quantity, item.unit, toCents(item.unitPrice), toCents(item.discount), item.netCents]
+      );
+      const movement = movements[index];
+      await tx.query(
+        `INSERT INTO stock_movements (date, product_id, type, direction, quantity, unit_cost, balance_after, reference_type, reference_id, journal_entry_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'invoice', $8, $9)`,
+        [data.date, movement.productId, movement.type, movement.direction, movement.quantity, movement.unitCost, movement.balanceAfter, invoiceId, journal.id]
+      );
+    }
+
+    if (!isCash) {
+      await recordPartyTransaction(
+        isSales
+          ? { partyId: data.partyId, date: data.date, type: 'invoice', referenceType: 'invoice', referenceId: invoiceId, debit: total, description: `فاتورة مبيعات ${docNumber}` }
+          : { partyId: data.partyId, date: data.date, type: 'invoice', referenceType: 'invoice', referenceId: invoiceId, credit: total, description: `فاتورة مشتريات ${docNumber}` },
+        tx
+      );
+    }
+
+    return { id: invoiceId, docNumber };
+  });
 }
 
 function docTypeLabel(type: string): string {

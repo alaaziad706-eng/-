@@ -1,4 +1,4 @@
-import { getDb, toCents, toEgp } from '@/db/db';
+import { getDb, toCents, toEgp, type SqlRunner } from '@/db/db';
 
 export interface Account {
   id: string;
@@ -62,8 +62,8 @@ export async function createAccount(data: {
 }
 
 // ===================== ترقيم المستندات =====================
-export async function nextDocNumber(docType: string): Promise<string> {
-  const db = await getDb();
+export async function nextDocNumber(docType: string, runner?: SqlRunner): Promise<string> {
+  const db = runner ?? (await getDb());
   const res = await db.query<{ prefix: string; next_number: number; padding: number }>(
     'SELECT prefix, next_number, padding FROM document_sequences WHERE doc_type = $1',
     [docType]
@@ -77,7 +77,7 @@ export async function nextDocNumber(docType: string): Promise<string> {
 }
 
 // ===================== إنشاء قيد محاسبي =====================
-export async function createJournalEntry(data: {
+export interface JournalEntryInput {
   date: string;
   description?: string;
   referenceType?: string;
@@ -85,7 +85,9 @@ export async function createJournalEntry(data: {
   activityId?: string | null;
   lines: { accountId: string; debit: number; credit: number; description?: string }[]; // مبالغ بجنيه
   createdBy?: string | null;
-}): Promise<{ id: string; entryNumber: string }> {
+}
+
+export async function createJournalEntry(data: JournalEntryInput, runner?: SqlRunner): Promise<{ id: string; entryNumber: string }> {
   // التحقق من التوازن
   const totalDebit = data.lines.reduce((s, l) => s + toCents(l.debit), 0);
   const totalCredit = data.lines.reduce((s, l) => s + toCents(l.credit), 0);
@@ -94,8 +96,13 @@ export async function createJournalEntry(data: {
   }
   if (totalDebit === 0) throw new Error('لا يمكن ترحيل قيد بقيمة صفر');
 
+  if (runner) return postJournalEntry(runner, data);
   const db = await getDb();
-  const entryNumber = await nextDocNumber('journal');
+  return db.transaction((tx) => postJournalEntry(tx, data));
+}
+
+async function postJournalEntry(db: SqlRunner, data: JournalEntryInput): Promise<{ id: string; entryNumber: string }> {
+  const entryNumber = await nextDocNumber('journal', db);
 
   const entryRes = await db.query<{ id: string }>(
     `INSERT INTO journal_entries (entry_number, date, description, reference_type, reference_id, activity_id, status, created_by)

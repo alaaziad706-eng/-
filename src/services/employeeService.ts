@@ -1,4 +1,4 @@
-import { getDb, toCents } from '@/db/db';
+import { getDb, toCents, toEgp, type SqlRunner } from '@/db/db';
 import { createJournalEntry } from './accountingService';
 
 export interface Employee {
@@ -118,55 +118,99 @@ export async function listSalaryRecords(month?: string): Promise<SalaryRecord[]>
            s.overtime, s.deductions, s.advance_deduct, s.net_salary, s.status
     FROM salary_records s JOIN employees e ON s.employee_id = e.id`;
   const params: unknown[] = [];
-  if (month) { params.push(month); query += ` WHERE s.month::text LIKE $${params.length}`; }
+  if (month) { params.push(`${month}%`); query += ` WHERE s.month::text LIKE $${params.length}`; }
   query += ' ORDER BY s.month DESC, e.name';
   const res = await db.query<SalaryRecord>(query, params);
   return res.rows;
 }
 
-export async function generatePayroll(data: { month: string; createdBy?: string | null }): Promise<void> {
-  const db = await getDb();
-  const employees = await db.query<{ id: string; base_salary: number; status: string }>(
-    'SELECT id, base_salary, status FROM employees WHERE status = $1', ['active']
+async function accrueSalary(
+  data: { employeeId: string; month: string; baseSalary: number; createdBy?: string | null },
+  runner: SqlRunner
+): Promise<void> {
+  const advances = await runner.query<{ id: string; installment_amount: number; remaining: number }>(
+    "SELECT id, installment_amount, remaining FROM employee_advances WHERE employee_id = $1 AND status = 'active' AND remaining > 0 ORDER BY date, id FOR UPDATE",
+    [data.employeeId]
   );
-  for (const emp of employees.rows) {
-    // التحقق من عدم وجود مسير لهذا الشهر
-    const exists = await db.query<{ count: number }>(
-      'SELECT count(*) as count FROM salary_records WHERE employee_id = $1 AND month::text LIKE $2',
-      [emp.id, data.month + '%']
-    );
-    if (exists.rows[0].count > 0) continue;
 
-    const net = emp.base_salary; // الراتب الأساسي = الصافي مؤقتًا
-    await db.query(
-      `INSERT INTO salary_records (employee_id, month, base_salary, overtime, deductions, advance_deduct, net_salary, status)
-       VALUES ($1, $2, $3, 0, 0, 0, $4, 'pending')`,
-      [emp.id, data.month, emp.base_salary, net]
+  const deductions = 0;
+  const grossAfterDeductions = data.baseSalary - deductions;
+  let advanceRecovery = 0;
+  for (const adv of advances.rows) {
+    const due = adv.installment_amount > 0 ? Math.min(adv.installment_amount, adv.remaining) : adv.remaining;
+    const take = Math.min(due, grossAfterDeductions - advanceRecovery);
+    if (take <= 0) continue;
+    advanceRecovery += take;
+    await runner.query(
+      "UPDATE employee_advances SET total_paid = total_paid + $1, remaining = remaining - $1, status = CASE WHEN remaining - $1 <= 0 THEN 'settled' ELSE 'active' END WHERE id = $2",
+      [take, adv.id]
     );
   }
+
+  const net = grossAfterDeductions - advanceRecovery;
+  let journalEntryId: string | null = null;
+  if (grossAfterDeductions > 0) {
+    const journal = await createJournalEntry({
+      date: `${data.month}-01`,
+      description: `استحقاق راتب ${data.month}`,
+      referenceType: 'salary',
+      lines: [
+        { accountId: 'acc_salaries', debit: toEgp(grossAfterDeductions), credit: 0 },
+        ...(advanceRecovery > 0 ? [{ accountId: 'acc_advances_emp', debit: 0, credit: toEgp(advanceRecovery) }] : []),
+        { accountId: 'acc_salaries_pay', debit: 0, credit: toEgp(net) },
+      ],
+      createdBy: data.createdBy,
+    }, runner);
+    journalEntryId = journal.id;
+  }
+
+  await runner.query(
+    `INSERT INTO salary_records (employee_id, month, base_salary, overtime, deductions, advance_deduct, net_salary, status, journal_entry_id)
+     VALUES ($1, $2, $3, 0, $4, $5, $6, 'pending', $7)`,
+    [data.employeeId, `${data.month}-01`, data.baseSalary, deductions, advanceRecovery, net, journalEntryId]
+  );
+}
+
+export async function generatePayroll(data: { month: string; createdBy?: string | null }): Promise<void> {
+  const db = await getDb();
+  await db.transaction(async (tx) => {
+    const employees = await tx.query<{ id: string; base_salary: number }>(
+      'SELECT id, base_salary FROM employees WHERE status = $1', ['active']
+    );
+    for (const emp of employees.rows) {
+      const exists = await tx.query<{ count: number }>(
+        'SELECT count(*) as count FROM salary_records WHERE employee_id = $1 AND month::text LIKE $2',
+        [emp.id, data.month + '%']
+      );
+      if (exists.rows[0].count > 0) continue;
+      await accrueSalary({ employeeId: emp.id, month: data.month, baseSalary: emp.base_salary, createdBy: data.createdBy }, tx);
+    }
+  });
 }
 
 export async function paySalary(id: string, createdBy?: string | null): Promise<void> {
   const db = await getDb();
-  const record = await db.query<{ employee_id: string; net_salary: number }>(
-    'SELECT employee_id, net_salary FROM salary_records WHERE id = $1', [id]
-  );
-  if (record.rows.length === 0) throw new Error('السجل غير موجود');
-  const r = record.rows[0];
+  await db.transaction(async (tx) => {
+    const record = await tx.query<{ net_salary: number; status: string }>(
+      'SELECT net_salary, status FROM salary_records WHERE id = $1 FOR UPDATE', [id]
+    );
+    if (record.rows.length === 0) throw new Error('السجل غير موجود');
+    const r = record.rows[0];
+    if (r.status !== 'pending') throw new Error('الراتب مدفوع بالفعل');
 
-  // قيد صرف الراتب: مدين الرواتب، دائن الخزينة
-  await createJournalEntry({
-    date: new Date().toISOString().slice(0, 10),
-    description: `صرف راتب ${r.net_salary / 100} ج.م`,
-    referenceType: 'salary',
-    lines: [
-      { accountId: 'acc_salaries', debit: r.net_salary / 100, credit: 0 },
-      { accountId: 'acc_cash', debit: 0, credit: r.net_salary / 100 },
-    ],
-    createdBy,
+    await createJournalEntry({
+      date: new Date().toISOString().slice(0, 10),
+      description: `صرف راتب ${toEgp(r.net_salary)} ج.م`,
+      referenceType: 'salary',
+      lines: [
+        { accountId: 'acc_salaries_pay', debit: toEgp(r.net_salary), credit: 0 },
+        { accountId: 'acc_cash', debit: 0, credit: toEgp(r.net_salary) },
+      ],
+      createdBy,
+    }, tx);
+
+    await tx.query("UPDATE salary_records SET status = 'paid', paid_at = now() WHERE id = $1", [id]);
   });
-
-  await db.query("UPDATE salary_records SET status = 'paid', paid_at = now() WHERE id = $1", [id]);
 }
 
 export interface EmployeeAdvance {
@@ -197,22 +241,22 @@ export async function createAdvance(data: {
 }): Promise<void> {
   if (data.amount <= 0) throw new Error('المبلغ يجب أن يكون أكبر من صفر');
   const db = await getDb();
+  await db.transaction(async (tx) => {
+    const journal = await createJournalEntry({
+      date: data.date,
+      description: `سلفة موظف`,
+      referenceType: 'advance',
+      lines: [
+        { accountId: 'acc_advances_emp', debit: data.amount, credit: 0 },
+        { accountId: 'acc_cash', debit: 0, credit: data.amount },
+      ],
+      createdBy: data.createdBy,
+    }, tx);
 
-  // قيد السلفة: مدين سلف الموظفين، دائن الخزينة
-  await createJournalEntry({
-    date: data.date,
-    description: `سلفة موظف`,
-    referenceType: 'advance',
-    lines: [
-      { accountId: 'acc_advances_emp', debit: data.amount, credit: 0 },
-      { accountId: 'acc_cash', debit: 0, credit: data.amount },
-    ],
-    createdBy: data.createdBy,
+    await tx.query(
+      `INSERT INTO employee_advances (employee_id, date, amount, repayment_method, installment_amount, total_paid, remaining, status, journal_entry_id)
+       VALUES ($1, $2, $3, $4, $5, 0, $3, 'active', $6)`,
+      [data.employeeId, data.date, toCents(data.amount), data.repaymentMethod ?? 'installment', toCents(data.installmentAmount ?? 0), journal.id]
+    );
   });
-
-  await db.query(
-    `INSERT INTO employee_advances (employee_id, date, amount, repayment_method, installment_amount, total_paid, remaining, status)
-     VALUES ($1, $2, $3, $4, $5, 0, $3, 'active')`,
-    [data.employeeId, data.date, toCents(data.amount), data.repaymentMethod ?? 'installment', toCents(data.installmentAmount ?? 0)]
-  );
 }
